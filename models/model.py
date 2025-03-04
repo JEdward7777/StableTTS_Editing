@@ -46,7 +46,7 @@ class StableTTS(nn.Module):
         self.cfg_dropout = 0.2
 
     @torch.inference_mode()
-    def synthesise(self, x, x_lengths, n_timesteps, temperature=1.0, y=None, length_scale=1.0, solver=None, cfg=1.0, prefix=None, postfix=None):
+    def synthesise(self, x, x_lengths, n_timesteps, temperature=1.0, y=None, length_scale=1.0, solver=None, cfg=1.0, prefix=None, postfix=None, prefix_text=None, suffix_text=None):
         """
         Generates mel-spectrogram from text. Returns:
             1. encoder outputs
@@ -95,12 +95,46 @@ class StableTTS(nn.Module):
         mu_y = mu_y.transpose(1, 2)
         encoder_outputs = mu_y[:, :, :y_max_length]
 
+        if prefix_text is not None:
+            p_x_lengths = torch.tensor([prefix_text.size(-1)], dtype=torch.long, device=x.device)
+            p_x, p_mu_x, p_x_mask = self.encoder(prefix_text, c, p_x_lengths)
+            p_logw = self.dp(p_x, p_x_mask, c)
+            p_w = torch.exp(p_logw) * p_x_mask
+            p_w_ceil = torch.ceil(p_w) * length_scale
+            p_y_lengths = torch.clamp_min(torch.sum(p_w_ceil, [1, 2]), 1).long()
+            p_y_max_length = p_y_lengths.max()
+            p_y_mask = sequence_mask(p_y_lengths, p_y_max_length).unsqueeze(1).to(x_mask.dtype)
+            p_attn_mask = p_x_mask.unsqueeze(-1) * p_y_mask.unsqueeze(2)
+            p_attn = generate_path(p_w_ceil.squeeze(1), p_attn_mask.squeeze(1)).unsqueeze(1)
+            p_mu_y = torch.matmul(p_attn.squeeze(1).transpose(1, 2), p_mu_x.transpose(1, 2))
+            p_mu_y = p_mu_y.transpose(1, 2)
+        else:
+            p_mu_y = None
+            p_y_mask = None
+
+        if suffix_text is not None:
+            s_x_lengths = torch.tensor([suffix_text.size(-1)], dtype=torch.long, device=x.device)
+            s_x, s_mu_x, s_x_mask = self.encoder(suffix_text, c, s_x_lengths)
+            s_logw = self.dp(s_x, s_x_mask, c)
+            s_w = torch.exp(s_logw) * s_x_mask
+            s_w_ceil = torch.ceil(s_w) * length_scale
+            s_y_lengths = torch.clamp_min(torch.sum(s_w_ceil, [1, 2]), 1).long()
+            s_y_max_length = s_y_lengths.max()
+            s_y_mask = sequence_mask(s_y_lengths, s_y_max_length).unsqueeze(1).to(x_mask.dtype)
+            s_attn_mask = s_x_mask.unsqueeze(-1) * s_y_mask.unsqueeze(2)
+            s_attn = generate_path(s_w_ceil.squeeze(1), s_attn_mask.squeeze(1)).unsqueeze(1)
+            s_mu_y = torch.matmul(s_attn.squeeze(1).transpose(1, 2), s_mu_x.transpose(1, 2))
+            s_mu_y = s_mu_y.transpose(1, 2)
+        else:
+            s_mu_y = None
+            s_y_mask = None
+
         # Generate sample tracing the probability flow
         if cfg == 1.0:
-            decoder_outputs = self.decoder(mu_y, y_mask, n_timesteps, temperature, c, solver, prefix=prefix, postfix=postfix)
+            decoder_outputs = self.decoder(mu_y, y_mask, n_timesteps, temperature, c, solver, prefix=prefix, postfix=postfix, p_mu=p_mu_y, p_mask=p_y_mask, s_mu=s_mu_y, s_mask=s_y_mask)
         else:
             cfg_kwargs = {'fake_speaker': self.fake_speaker, 'fake_content': self.fake_content, 'cfg_strength': cfg}
-            decoder_outputs = self.decoder(mu_y, y_mask, n_timesteps, temperature, c, solver, cfg_kwargs, prefix=prefix, postfix=postfix)
+            decoder_outputs = self.decoder(mu_y, y_mask, n_timesteps, temperature, c, solver, cfg_kwargs, prefix=prefix, postfix=postfix, p_mu=p_mu_y, p_mask=p_y_mask, s_mu=s_mu_y, s_mask=s_y_mask)
             
         if prefix is None and postfix is None:
             #The length is extended for the prefix and postfix and instead of just trying

@@ -64,7 +64,8 @@ class StableTTSAPI(nn.Module):
         self.supported_languages = self.g2p_mapping.keys()
         
     @ torch.inference_mode()
-    def inference(self, text, ref_audio, language, step, temperature=1.0, length_scale=1.0, solver=None, cfg=3.0, prefix=None, postfix=None):
+    def inference(self, text, ref_audio, language, step, temperature=1.0, length_scale=1.0, solver=None, cfg=3.0, prefix=None, postfix=None,
+                  prefix_text=None, suffix_text=None):
         device = next(self.parameters()).device
         phonemizer = self.g2p_mapping.get(language)
         
@@ -82,8 +83,16 @@ class StableTTSAPI(nn.Module):
         if postfix is not None:
             postfix = load_and_resample_audio(postfix, self.mel_config.sample_rate).to(device)
             postfix = self.mel_extractor(postfix)
+
+        if prefix_text is not None:
+            prefix_text = phonemizer(prefix_text)
+            prefix_text = torch.tensor(intersperse(cleaned_text_to_sequence(prefix_text), item=0), dtype=torch.long, device=device).unsqueeze(0)
         
-        mel_output = self.tts_model.synthesise(text, text_length, step, temperature, ref_audio, length_scale, solver, cfg, prefix=prefix, postfix=postfix)['decoder_outputs']
+        if suffix_text is not None:
+            suffix_text = phonemizer(suffix_text)
+            suffix_text = torch.tensor(intersperse(cleaned_text_to_sequence(suffix_text), item=0), dtype=torch.long, device=device).unsqueeze(0)
+        
+        mel_output = self.tts_model.synthesise(text, text_length, step, temperature, ref_audio, length_scale, solver, cfg, prefix=prefix, postfix=postfix, prefix_text=prefix_text, suffix_text=suffix_text)['decoder_outputs']
 
         #josh_hacking.plot_mel_spectrogram(mel_output, self.mel_config)
 
@@ -113,13 +122,13 @@ if __name__ == '__main__':
 
     prefix_text = "Jesus loves me this I"
     suffix_text = "For the Bible tells me so."
-    text = "believe"
+    text = "understand"
     audio = "./ref_full.wav"
     prefix = "./ref_lead_in.wav"
     postfix = "./ref_lead_out.wav"
     language = 'english'
     
-    audio_output, mel_output = model.inference(text, audio, language, 10, solver='dopri5', cfg=3, prefix=prefix, postfix=postfix)
+    audio_output, mel_output = model.inference(text, audio, language, 10, solver='dopri5', cfg=3, prefix=prefix, postfix=postfix, prefix_text=prefix_text, suffix_text=suffix_text)
 
     print(audio_output.shape)
     print(mel_output.shape)

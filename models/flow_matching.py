@@ -24,7 +24,7 @@ class CFMDecoder(torch.nn.Module):
         self.estimator = Decoder(noise_channels, cond_channels, hidden_channels, out_channels, filter_channels, p_dropout, n_layers, n_heads, kernel_size, gin_channels)
 
     @torch.inference_mode()
-    def forward(self, mu, mask, n_timesteps, temperature=1.0, c=None, solver=None, cfg_kwargs=None, prefix=None, postfix=None):
+    def forward(self, mu, mask, n_timesteps, temperature=1.0, c=None, solver=None, cfg_kwargs=None, prefix=None, postfix=None, p_mu=None, p_mask=None, s_mu=None, s_mask=None):
         """Forward diffusion
 
         Args:
@@ -45,14 +45,34 @@ class CFMDecoder(torch.nn.Module):
         """
         
         z = torch.randn_like(mu) * temperature
-
+        #This code doesn't work for batches yet because the mask isn't used and the prefixes are not probably going to be right justified.
         if prefix is not None:
             z = torch.cat((prefix, z), dim=-1)
-            mu = torch.cat((prefix*0, mu), dim=-1)
+            if p_mu is None:
+                mu = torch.cat((prefix*0, mu), dim=-1)
+            else:
+                if prefix.shape[-1] > p_mu.shape[-1]:
+                    #just pad p_mu with zeros.
+                    p_mu = torch.cat((torch.zeros(*p_mu.shape[:-1], prefix.shape[-1]-p_mu.shape[-1], device=p_mu.device), p_mu), dim=-1)
+                else:
+                    #slice p_mu to match prefix loseing the front side.
+                    p_mu = p_mu[:, :, p_mu.shape[-1]-prefix.shape[-1]:]
+                mu = torch.cat((p_mu, mu), dim=-1)
+
             mask = torch.cat((torch.zeros(*mask.shape[:-1], prefix.shape[-1], device=mask.device), mask), dim=-1)
+
         if postfix is not None:
             z = torch.cat((z, postfix), dim=-1)
-            mu = torch.cat((mu, postfix*0), dim=-1)
+            if s_mu is None:
+                mu = torch.cat((mu, postfix*0), dim=-1)
+            else:
+                if postfix.shape[-1] > s_mu.shape[-1]:
+                    #just pad s_mu with zeros.
+                    s_mu = torch.cat((s_mu, torch.zeros(*s_mu.shape[:-1], postfix.shape[-1]-s_mu.shape[-1], device=s_mu.device)), dim=-1)
+                else:
+                    #slice s_mu to match postfix loseing the back side.
+                    s_mu = s_mu[:, :, 0:postfix.shape[-1]]
+                mu = torch.cat((mu, s_mu), dim=-1)
             mask = torch.cat((mask, torch.zeros(*mask.shape[:-1], postfix.shape[-1], device=mask.device)), dim=-1)
 
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device)
