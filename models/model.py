@@ -46,7 +46,7 @@ class StableTTS(nn.Module):
         self.cfg_dropout = 0.2
 
     @torch.inference_mode()
-    def synthesise(self, x, x_lengths, n_timesteps, temperature=1.0, y=None, length_scale=1.0, solver=None, cfg=1.0):
+    def synthesise(self, x, x_lengths, n_timesteps, temperature=1.0, y=None, length_scale=1.0, solver=None, cfg=1.0, prefix=None, postfix=None):
         """
         Generates mel-spectrogram from text. Returns:
             1. encoder outputs
@@ -97,12 +97,15 @@ class StableTTS(nn.Module):
 
         # Generate sample tracing the probability flow
         if cfg == 1.0:
-            decoder_outputs = self.decoder(mu_y, y_mask, n_timesteps, temperature, c, solver)
+            decoder_outputs = self.decoder(mu_y, y_mask, n_timesteps, temperature, c, solver, prefix=prefix, postfix=postfix)
         else:
             cfg_kwargs = {'fake_speaker': self.fake_speaker, 'fake_content': self.fake_content, 'cfg_strength': cfg}
-            decoder_outputs = self.decoder(mu_y, y_mask, n_timesteps, temperature, c, solver, cfg_kwargs)
+            decoder_outputs = self.decoder(mu_y, y_mask, n_timesteps, temperature, c, solver, cfg_kwargs, prefix=prefix, postfix=postfix)
             
-        decoder_outputs = decoder_outputs[:, :, :y_max_length]
+        if prefix is None and postfix is None:
+            #The length is extended for the prefix and postfix and instead of just trying
+            #to figure out what the new length is, I am just going to not trim it.
+            decoder_outputs = decoder_outputs[:, :, :y_max_length]
 
 
         return {

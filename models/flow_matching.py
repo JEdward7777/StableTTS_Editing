@@ -7,6 +7,8 @@ from torchdiffeq import odeint
 
 from models.estimator import Decoder
 
+import josh_hacking
+
 # modified from https://github.com/shivammehta25/Matcha-TTS/blob/main/matcha/models/components/flow_matching.py
 class CFMDecoder(torch.nn.Module):
     def __init__(self, noise_channels, cond_channels, hidden_channels, out_channels, filter_channels, n_heads, n_layers, kernel_size, p_dropout, gin_channels):
@@ -22,7 +24,7 @@ class CFMDecoder(torch.nn.Module):
         self.estimator = Decoder(noise_channels, cond_channels, hidden_channels, out_channels, filter_channels, p_dropout, n_layers, n_heads, kernel_size, gin_channels)
 
     @torch.inference_mode()
-    def forward(self, mu, mask, n_timesteps, temperature=1.0, c=None, solver=None, cfg_kwargs=None):
+    def forward(self, mu, mask, n_timesteps, temperature=1.0, c=None, solver=None, cfg_kwargs=None, prefix=None, postfix=None):
         """Forward diffusion
 
         Args:
@@ -43,6 +45,16 @@ class CFMDecoder(torch.nn.Module):
         """
         
         z = torch.randn_like(mu) * temperature
+
+        if prefix is not None:
+            z = torch.cat((prefix, z), dim=-1)
+            mu = torch.cat((prefix*0, mu), dim=-1)
+            mask = torch.cat((torch.zeros(*mask.shape[:-1], prefix.shape[-1], device=mask.device), mask), dim=-1)
+        if postfix is not None:
+            z = torch.cat((z, postfix), dim=-1)
+            mu = torch.cat((mu, postfix*0), dim=-1)
+            mask = torch.cat((mask, torch.zeros(*mask.shape[:-1], postfix.shape[-1], device=mask.device)), dim=-1)
+
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device)
         
         # cfg control
@@ -52,6 +64,11 @@ class CFMDecoder(torch.nn.Module):
             estimator = functools.partial(self.cfg_wrapper, mask=mask, mu=mu, c=c, cfg_kwargs=cfg_kwargs)
             
         trajectory = odeint(estimator, z, t_span, method=solver, rtol=1e-5, atol=1e-5)
+
+        for i in range( trajectory.shape[0] ):
+            josh_hacking.plot_mel_spectrogram(trajectory[i], filename=f"trajectory_{i}.png")
+
+
         return trajectory[-1]
     
     # cfg inference

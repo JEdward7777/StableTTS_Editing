@@ -17,6 +17,8 @@ from text.japanese import japanese_to_ipa2
 from datas.dataset import intersperse
 from utils.audio import load_and_resample_audio
 
+import josh_hacking
+
 def get_vocoder(model_path, model_name='ffgan') -> nn.Module:
     if model_name == 'ffgan':
         # training or changing ffgan config is not supported in this repo
@@ -62,7 +64,7 @@ class StableTTSAPI(nn.Module):
         self.supported_languages = self.g2p_mapping.keys()
         
     @ torch.inference_mode()
-    def inference(self, text, ref_audio, language, step, temperature=1.0, length_scale=1.0, solver=None, cfg=3.0):
+    def inference(self, text, ref_audio, language, step, temperature=1.0, length_scale=1.0, solver=None, cfg=3.0, prefix=None, postfix=None):
         device = next(self.parameters()).device
         phonemizer = self.g2p_mapping.get(language)
         
@@ -72,8 +74,19 @@ class StableTTSAPI(nn.Module):
         
         ref_audio = load_and_resample_audio(ref_audio, self.mel_config.sample_rate).to(device)
         ref_audio = self.mel_extractor(ref_audio)
+
+        if prefix is not None:
+            prefix = load_and_resample_audio(prefix, self.mel_config.sample_rate).to(device)
+            prefix = self.mel_extractor(prefix)
         
-        mel_output = self.tts_model.synthesise(text, text_length, step, temperature, ref_audio, length_scale, solver, cfg)['decoder_outputs']
+        if postfix is not None:
+            postfix = load_and_resample_audio(postfix, self.mel_config.sample_rate).to(device)
+            postfix = self.mel_extractor(postfix)
+        
+        mel_output = self.tts_model.synthesise(text, text_length, step, temperature, ref_audio, length_scale, solver, cfg, prefix=prefix, postfix=postfix)['decoder_outputs']
+
+        #josh_hacking.plot_mel_spectrogram(mel_output, self.mel_config)
+
         audio_output = self.vocoder_model(mel_output)
         return audio_output.cpu(), mel_output.cpu()
     
@@ -90,10 +103,24 @@ if __name__ == '__main__':
     model = StableTTSAPI(tts_model_path, vocoder_model_path, 'vocos')
     model.to(device)
     
-    text = '樱落满殇祈念集……殇歌花落集思祈……樱花满地集于我心……揲舞纷飞祈愿相随……'
-    audio = './audio_1.wav'
+    #text = '樱落满殇祈念集……殇歌花落集思祈……樱花满地集于我心……揲舞纷飞祈愿相随……'
+    #audio = './audio_1.wav'
+    #language = 'chinese'
+
+    # text = "In the Beginning God created the Heavens and the Earth."
+    # audio = "./audios/josh.wav"
+    # language = 'english'
+
+    prefix_text = "Jesus loves me this I"
+    suffix_text = "For the Bible tells me so."
+    text = "believe"
+    audio = "./ref_full.wav"
+    prefix = "./ref_lead_in.wav"
+    postfix = "./ref_lead_out.wav"
+    language = 'english'
     
-    audio_output, mel_output = model.inference(text, audio, 'chinese', 10, solver='dopri5', cfg=3)
+    audio_output, mel_output = model.inference(text, audio, language, 10, solver='dopri5', cfg=3, prefix=prefix, postfix=postfix)
+
     print(audio_output.shape)
     print(mel_output.shape)
     
