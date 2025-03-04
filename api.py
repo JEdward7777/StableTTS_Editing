@@ -120,9 +120,9 @@ if __name__ == '__main__':
     # audio = "./audios/josh.wav"
     # language = 'english'
 
-    prefix_text = "Jesus loves me this I"
+    prefix_text = "Jesus loves me this I "
     suffix_text = "For the Bible tells me so."
-    text = "understand"
+    text = " was told by my sunday school teacher, "
     audio = "./ref_full.wav"
     prefix = "./ref_lead_in.wav"
     postfix = "./ref_lead_out.wav"

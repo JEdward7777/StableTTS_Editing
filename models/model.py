@@ -75,6 +75,16 @@ class StableTTS(nn.Module):
                 # Alignment map between text and mel spectrogram
         """
 
+        x_orig = x
+
+        if prefix_text is not None:
+            x = torch.cat([prefix_text, x], dim=-1)
+            x_lengths = x_lengths + prefix_text.size(-1)
+
+        if suffix_text is not None: 
+            x = torch.cat([x, suffix_text], dim=-1)
+            x_lengths = x_lengths + suffix_text.size(-1)
+
         # Get encoder_outputs `mu_x` and log-scaled token durations `logw`
         c = self.ref_encoder(y, None)
         x, mu_x, x_mask = self.encoder(x, c, x_lengths)
@@ -95,39 +105,54 @@ class StableTTS(nn.Module):
         mu_y = mu_y.transpose(1, 2)
         encoder_outputs = mu_y[:, :, :y_max_length]
 
+        
+        #do the suffix first so that the mu_y indexes are correct for the prefix.
+        if suffix_text is not None:
+            #now need to figure out where the suffix text starts so that we can trim it off.
+            p_t_length = prefix_text.size(-1) + x_orig.size(-1)
+
+            #now figure out where in the y dimension that is.
+            attn_sliced = attn[0, 0, p_t_length, : ]
+            non_zero_indeces = (attn_sliced != 0).nonzero(as_tuple=True)[0]
+
+            #now split the mu_y, p_mu_y out from eachother.
+            assert non_zero_indeces.numel() > 0, "Didn't find suffix text in alignment map"
+
+            text_end = non_zero_indeces[-1] + 1
+
+            s_mu_y = mu_y[:, :, text_end:]
+            s_y_mask = y_mask[:, :, text_end:]
+
+            mu_y = mu_y[:, :, :text_end]
+            y_mask = y_mask[:, :, :text_end]
+        else:
+            s_mu_y = None
+            s_y_mask = None
+
         if prefix_text is not None:
-            p_x_lengths = torch.tensor([prefix_text.size(-1)], dtype=torch.long, device=x.device)
-            p_x, p_mu_x, p_x_mask = self.encoder(prefix_text, c, p_x_lengths)
-            p_logw = self.dp(p_x, p_x_mask, c)
-            p_w = torch.exp(p_logw) * p_x_mask
-            p_w_ceil = torch.ceil(p_w) * length_scale
-            p_y_lengths = torch.clamp_min(torch.sum(p_w_ceil, [1, 2]), 1).long()
-            p_y_max_length = p_y_lengths.max()
-            p_y_mask = sequence_mask(p_y_lengths, p_y_max_length).unsqueeze(1).to(x_mask.dtype)
-            p_attn_mask = p_x_mask.unsqueeze(-1) * p_y_mask.unsqueeze(2)
-            p_attn = generate_path(p_w_ceil.squeeze(1), p_attn_mask.squeeze(1)).unsqueeze(1)
-            p_mu_y = torch.matmul(p_attn.squeeze(1).transpose(1, 2), p_mu_x.transpose(1, 2))
-            p_mu_y = p_mu_y.transpose(1, 2)
+            #what is the length of the prefix_text.
+            #go one past the length of the prefix text.
+            p_length = prefix_text.size(-1) + 1
+
+            #now figure out where in the y dimension that is.
+            attn_sliced = attn[0, 0, p_length, : ]
+            non_zero_indeces = (attn_sliced != 0).nonzero(as_tuple=True)[0]
+    
+
+            #now split the mu_y, p_mu_y out from eachother.
+            assert non_zero_indeces.numel() > 0, "Didn't find prefix text in alignment map"
+
+            text_start = non_zero_indeces[0]
+
+            p_mu_y = mu_y[:, :, :text_start]
+            p_y_mask = y_mask[:, :, :text_start]
+
+            mu_y = mu_y[:, :, text_start:]
+            y_mask = y_mask[:, :, text_start:]
         else:
             p_mu_y = None
             p_y_mask = None
 
-        if suffix_text is not None:
-            s_x_lengths = torch.tensor([suffix_text.size(-1)], dtype=torch.long, device=x.device)
-            s_x, s_mu_x, s_x_mask = self.encoder(suffix_text, c, s_x_lengths)
-            s_logw = self.dp(s_x, s_x_mask, c)
-            s_w = torch.exp(s_logw) * s_x_mask
-            s_w_ceil = torch.ceil(s_w) * length_scale
-            s_y_lengths = torch.clamp_min(torch.sum(s_w_ceil, [1, 2]), 1).long()
-            s_y_max_length = s_y_lengths.max()
-            s_y_mask = sequence_mask(s_y_lengths, s_y_max_length).unsqueeze(1).to(x_mask.dtype)
-            s_attn_mask = s_x_mask.unsqueeze(-1) * s_y_mask.unsqueeze(2)
-            s_attn = generate_path(s_w_ceil.squeeze(1), s_attn_mask.squeeze(1)).unsqueeze(1)
-            s_mu_y = torch.matmul(s_attn.squeeze(1).transpose(1, 2), s_mu_x.transpose(1, 2))
-            s_mu_y = s_mu_y.transpose(1, 2)
-        else:
-            s_mu_y = None
-            s_y_mask = None
 
         # Generate sample tracing the probability flow
         if cfg == 1.0:
