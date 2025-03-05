@@ -9,8 +9,7 @@ from torchaudio.transforms import Spectrogram
 
 
 class MultiPeriodDiscriminator(nn.Module):
-    # def __init__(self, periods: Tuple[int, ...] = (2, 3, 5, 7, 11)):
-    def __init__(self, periods: Tuple[int, ...] = (2, 3, 5, 7, 11, 17, 23, 37)):
+    def __init__(self, periods: Tuple[int, ...] = (2, 3, 5, 7, 11)):
         super().__init__()
         self.discriminators = nn.ModuleList([DiscriminatorP(period=p) for p in periods])
 
@@ -116,8 +115,7 @@ class DiscriminatorR(nn.Module):
         window_length: int,
         channels: int = 32,
         hop_factor: float = 0.25,
-        bands: Tuple[Tuple[float, float], ...] = ((0.0, 0.1), (0.1, 0.2), (0.2, 0.3), (0.3, 0.4), (0.4, 0.5), (0.5, 0.6), (0.6, 0.7), (0.7, 0.8), (0.8, 0.9), (0.9, 1.0)),
-        # bands: Tuple[Tuple[float, float], ...] = ((0.0, 0.1), (0.1, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 1.0)),
+        bands: Tuple[Tuple[float, float], ...] = ((0.0, 0.1), (0.1, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 1.0)),
     ):
         super().__init__()
         self.window_length = window_length

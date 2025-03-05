@@ -62,7 +62,7 @@ def collate_fn(batch):
 # random slice mel for reference encoder to prevent overfitting
 def random_slice_tensor(x: torch.Tensor):
     length = x.size(-1)
-    if length < 8:
+    if length < 12:
         return x 
     segmnt_size = random.randint(length // 12, length // 3)
     start = random.randint(0, length - segmnt_size)

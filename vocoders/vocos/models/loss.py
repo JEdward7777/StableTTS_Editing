@@ -5,6 +5,7 @@ from dataclasses import asdict
 
 from utils.audio import LogMelSpectrogram
 from config import MelConfig
+
 # Adapted from https://github.com/descriptinc/descript-audio-codec/blob/main/dac/nn/loss.py under the MIT license.
 class MultiScaleMelSpectrogramLoss(nn.Module):
     def __init__(self, n_mels: List[int] = [5, 10, 20, 40, 80, 160, 320], window_lengths: List[int] = [32, 64, 128, 256, 512, 1024, 2048]):
