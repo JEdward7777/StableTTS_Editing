@@ -96,8 +96,8 @@ class CFMDecoder(torch.nn.Module):
             
         trajectory = odeint(estimator, z, t_span, method=solver, rtol=1e-5, atol=1e-5)
 
-        for i in range( trajectory.shape[0] ):
-            josh_hacking.plot_mel_spectrogram(trajectory[i], filename=f"trajectory_{i}.png")
+        # for i in range( trajectory.shape[0] ):
+        #     josh_hacking.plot_mel_spectrogram(trajectory[i], filename=f"trajectory_{i}.png")
 
 
         return trajectory[-1]
