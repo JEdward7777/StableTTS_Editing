@@ -59,7 +59,13 @@ class CFMDecoder(torch.nn.Module):
                     p_mu = p_mu[:, :, p_mu.shape[-1]-prefix.shape[-1]:]
                 mu = torch.cat((p_mu, mu), dim=-1)
 
-            mask = torch.cat((torch.zeros(*mask.shape[:-1], prefix.shape[-1], device=mask.device), mask), dim=-1)
+            prefix_mask = torch.zeros(*mask.shape[:-1], prefix.shape[-1], device=mask.device)
+            #feather the end of the mask
+            # prefix_mask[:, :, -1] = .8
+            # prefix_mask[:, :, -2] = .5
+            # prefix_mask[:, :, -3] = .2
+            
+            mask = torch.cat((prefix_mask, mask), dim=-1)
 
         if postfix is not None:
             z = torch.cat((z, postfix), dim=-1)
@@ -73,7 +79,12 @@ class CFMDecoder(torch.nn.Module):
                     #slice s_mu to match postfix loseing the back side.
                     s_mu = s_mu[:, :, 0:postfix.shape[-1]]
                 mu = torch.cat((mu, s_mu), dim=-1)
-            mask = torch.cat((mask, torch.zeros(*mask.shape[:-1], postfix.shape[-1], device=mask.device)), dim=-1)
+            postfix_mask = torch.zeros(*mask.shape[:-1], postfix.shape[-1], device=mask.device)
+            #feather the start of the postfix_mask
+            # postfix_mask[:, :, 0] = .8
+            # postfix_mask[:, :, 1] = .5
+            # postfix_mask[:, :, 2] = .2
+            mask = torch.cat((mask, postfix_mask), dim=-1)
 
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device)
         

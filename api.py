@@ -120,13 +120,24 @@ if __name__ == '__main__':
     # audio = "./audios/josh.wav"
     # language = 'english'
 
-    prefix_text = "Jesus loves me this I "
-    suffix_text = "For the Bible tells me so."
-    text = " was told by my sunday school teacher, "
+    prefix_text = "this I "
+    text = " understand, "
+    suffix_text = "for the "
     audio = "./ref_full.wav"
     prefix = "./ref_lead_in.wav"
     postfix = "./ref_lead_out.wav"
     language = 'english'
+
+#     text = """
+
+# 3 Now there was a Pharisee, a man named Nicodemus who was a member of the Jewish ruling council. 2 He came to Jesus at night and said, “Rabbi, we know that you are a teacher who has come from God. For no one could perform the signs you are doing if God were not with him.”
+
+# 3 Jesus replied, “Very truly I tell you, no one can see the kingdom of God unless they are born again.[a]”
+
+# 4 “How can someone be born when they are old?” Nicodemus asked. “Surely they cannot enter a second time into their mother’s womb to be born!”
+
+# 5 Jesus answered, “Very truly I tell you, no one can enter the kingdom of God unless they are born of water and the Spirit. 6 Flesh gives birth to flesh, but the Spirit[b] gives birth to spirit. 7 You should not be surprised at my saying, ‘You[c] must be born again.’ 8 The wind blows wherever it pleases. You hear its sound, but you cannot tell where it comes from or where it is going. So it is with everyone born of the Spirit.”[d]
+# """
     
     audio_output, mel_output = model.inference(text, audio, language, 10, solver='dopri5', cfg=3, prefix=prefix, postfix=postfix, prefix_text=prefix_text, suffix_text=suffix_text)
 
