@@ -39,7 +39,7 @@ class TrainConfig:
     model_save_path: str = './checkpoints'
     log_dir: str = './runs'
     log_interval: int = 16
-    save_interval: int = 1
+    save_interval: int = 50
     warmup_steps: int = 200
     
 @dataclass

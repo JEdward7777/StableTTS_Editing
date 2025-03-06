@@ -2,7 +2,7 @@ torch
 torchaudio
 
 tqdm
-numpy
+numpy < 2.0
 soundfile # to make sure that torchaudio has at least one valid backend
 
 tensorboard

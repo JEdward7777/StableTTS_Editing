@@ -18,7 +18,9 @@ device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cp
 
 @dataclass
 class DataConfig:
-    input_filelist_path = './filelists/filelist.txt' # a filelist contains 'audiopath | text'
+    input_filelist_path = '../obs_data/chunking_obs_for_stable_tts/data/file_list.txt'
+    file_list_relative_path = '../obs_data/chunking_obs_for_stable_tts'
+    #input_filelist_path = './filelists/filelist.txt' # a filelist contains 'audiopath | text'
     output_filelist_path = './filelists/filelist.json' # path to save filelist
     output_feature_path = './stableTTS_datasets' # path to save resampled audios and mel features
     language = 'english' # chinese, japanese or english
@@ -35,6 +37,7 @@ train_config = TrainConfig()
 mel_config = MelConfig()
 
 input_filelist_path = data_config.input_filelist_path
+file_list_relative_path = data_config.file_list_relative_path
 output_filelist_path = data_config.output_filelist_path
 output_feature_path = data_config.output_feature_path
 
@@ -51,11 +54,13 @@ mel_extractor = LogMelSpectrogram(**asdict(mel_config)).to(device)
 
 g2p = g2p_mapping.get(data_config.language)
     
-def load_filelist(path) -> list:
+def load_filelist(base_folder,path) -> list:
     file_list = []
     with open(path, 'r', encoding='utf-8') as f:
         for idx, line in enumerate(f):
             audio_path, text = line.strip().split('|', maxsplit=1)
+            if base_folder is not None:
+                audio_path = os.path.join(base_folder, audio_path)
             file_list.append((str(idx), audio_path, text))
     return file_list
 
@@ -84,7 +89,7 @@ def process_filelist(line) -> str:
 
 def main():
     set_start_method('spawn') # CUDA must use spawn method
-    input_filelist = load_filelist(input_filelist_path)
+    input_filelist = load_filelist(file_list_relative_path,input_filelist_path)
     results = []
     
     with Pool(processes=2) as pool:
