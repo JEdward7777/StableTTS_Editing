@@ -91,8 +91,10 @@ def align_text_to_audio(api, text: str, audio_path: str, language: str = 'englis
         attn = monotonic_align.maximum_path(neg_cent, attn_mask.squeeze(1)).unsqueeze(1).detach()
 
     # --- Extract per-token durations ---
-    # attn shape: (1, 1, interspersed_text_length, mel_length)
-    durations = attn.sum(dim=3).squeeze(0).squeeze(0)  # (interspersed_text_length,)
+    # attn shape from MAS: (1, 1, mel_length, interspersed_text_length)
+    # Summing over dim=2 (mel_length) gives duration per text token
+    # This matches the training code: logw_ = torch.log(1e-8 + attn.sum(2)) * x_mask
+    durations = attn.sum(dim=2).squeeze(0).squeeze(0)  # (interspersed_text_length,)
 
     # --- Map token durations → word-level frame boundaries ---
     word_boundaries = _compute_word_boundaries(durations, word_phoneme_boundaries, mel_config)
@@ -234,6 +236,8 @@ def _compute_word_boundaries(durations: torch.Tensor, word_phoneme_boundaries: l
             'end_frame': end_frame,
             'start_time': start_time,
             'end_time': end_time,
+            'phoneme_start': phoneme_start,
+            'phoneme_end': phoneme_end,
         })
 
     return word_boundaries
