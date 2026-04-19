@@ -13,7 +13,8 @@ from api import StableTTSAPI
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-tts_model_path = './checkpoints/checkpoint_0.pt'
+#30 55 82 117
+tts_model_path = './checkpoints/checkpoint_156.pt'
 vocoder_model_path = './vocoders/pretrained/firefly-gan-base-generator.ckpt'
 vocoder_type = 'ffgan'
 

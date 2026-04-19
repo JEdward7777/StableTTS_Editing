@@ -13,7 +13,8 @@ from api import StableTTSAPI
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-tts_model_path = './checkpoints/checkpoint_0.pt'
+#tts_model_path = './checkpoints/checkpoint_2850.pt'
+tts_model_path = './checkpoints/checkpoint_50.pt'
 vocoder_model_path = './vocoders/pretrained/firefly-gan-base-generator.ckpt'
 vocoder_type = 'ffgan'
 
@@ -156,7 +157,7 @@ def main():
         tts_button.click(inference, [input_text_gr, input_prefix_gr, input_postfix_gr, prefix_audio_gr, postfix_audio_gr, language_gr, step_gr, temperature_gr, length_scale_gr, solver_gr, cfg_gr], outputs=[audio_gr, mel_gr])
 
     demo.queue()  
-    demo.launch(debug=True, show_api=True, share=True)
+    demo.launch(debug=True, show_api=True, share=False)
 
 
 if __name__ == '__main__':
