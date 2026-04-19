@@ -1,3 +1,6 @@
 venv/*
 venv311/*
 __pycache__
+checkpoints/*
+runs/*
+stableTTS_datasets/*
