@@ -24,7 +24,7 @@ class CFMDecoder(torch.nn.Module):
         self.estimator = Decoder(noise_channels, cond_channels, hidden_channels, out_channels, filter_channels, p_dropout, n_layers, n_heads, kernel_size, gin_channels)
 
     @torch.inference_mode()
-    def forward(self, mu, mask, n_timesteps, temperature=1.0, c=None, solver=None, cfg_kwargs=None, prefix=None, postfix=None, p_mu=None, p_mask=None, s_mu=None, s_mask=None):
+    def forward(self, mu, mask, n_timesteps, temperature=1.0, c=None, solver=None, cfg_kwargs=None, prefix=None, postfix=None, p_mu=None, p_mask=None, s_mu=None, s_mask=None, blend_opts=None):
         """Forward diffusion
 
         Args:
@@ -38,12 +38,18 @@ class CFMDecoder(torch.nn.Module):
                 shape: (batch_size, gin_channels)
             solver: see https://github.com/rtqichen/torchdiffeq for supported solvers
             cfg_kwargs: used for cfg inference
+            blend_opts (dict, optional): blending/feathering options. Keys:
+                - 'mask_feather_frames' (int): number of frames to feather at prefix/postfix boundaries.
+                  Creates a linear ramp from 0→1 at the edge of the mask. Default: 0 (no feathering).
 
         Returns:
             sample: generated mel-spectrogram
                 shape: (batch_size, n_feats, mel_timesteps)
         """
-        
+        if blend_opts is None:
+            blend_opts = {}
+        mask_feather_frames = blend_opts.get('mask_feather_frames', 0)
+
         z = torch.randn_like(mu) * temperature
         #This code doesn't work for batches yet because the mask isn't used and the prefixes are not probably going to be right justified.
         if prefix is not None:
@@ -60,11 +66,12 @@ class CFMDecoder(torch.nn.Module):
                 mu = torch.cat((p_mu, mu), dim=-1)
 
             prefix_mask = torch.zeros(*mask.shape[:-1], prefix.shape[-1], device=mask.device)
-            #feather the end of the mask
-            # prefix_mask[:, :, -1] = .8
-            # prefix_mask[:, :, -2] = .5
-            # prefix_mask[:, :, -3] = .2
-            
+            # Apply feathering: linear ramp from 0→1 at the end of the prefix mask
+            if mask_feather_frames > 0:
+                n_feather = min(mask_feather_frames, prefix.shape[-1])
+                ramp = torch.linspace(0, 1, n_feather + 2, device=mask.device)[1:-1]  # exclude 0 and 1
+                prefix_mask[:, :, -n_feather:] = ramp
+
             mask = torch.cat((prefix_mask, mask), dim=-1)
 
         if postfix is not None:
@@ -80,20 +87,21 @@ class CFMDecoder(torch.nn.Module):
                     s_mu = s_mu[:, :, 0:postfix.shape[-1]]
                 mu = torch.cat((mu, s_mu), dim=-1)
             postfix_mask = torch.zeros(*mask.shape[:-1], postfix.shape[-1], device=mask.device)
-            #feather the start of the postfix_mask
-            # postfix_mask[:, :, 0] = .8
-            # postfix_mask[:, :, 1] = .5
-            # postfix_mask[:, :, 2] = .2
+            # Apply feathering: linear ramp from 1→0 at the start of the postfix mask
+            if mask_feather_frames > 0:
+                n_feather = min(mask_feather_frames, postfix.shape[-1])
+                ramp = torch.linspace(1, 0, n_feather + 2, device=mask.device)[1:-1]  # exclude 1 and 0
+                postfix_mask[:, :, :n_feather] = ramp
             mask = torch.cat((mask, postfix_mask), dim=-1)
 
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device)
-        
+
         # cfg control
         if cfg_kwargs is None:
             estimator = functools.partial(self.estimator, mask=mask, mu=mu, c=c)
         else:
             estimator = functools.partial(self.cfg_wrapper, mask=mask, mu=mu, c=c, cfg_kwargs=cfg_kwargs)
-            
+
         trajectory = odeint(estimator, z, t_span, method=solver, rtol=1e-5, atol=1e-5)
 
         # for i in range( trajectory.shape[0] ):
@@ -101,16 +109,16 @@ class CFMDecoder(torch.nn.Module):
 
 
         return trajectory[-1]
-    
+
     # cfg inference
     def cfg_wrapper(self, t, x, mask, mu, c, cfg_kwargs):
         fake_speaker = cfg_kwargs['fake_speaker'].repeat(x.size(0), 1)
         fake_content = cfg_kwargs['fake_content'].repeat(x.size(0), 1, x.size(-1))
         cfg_strength = cfg_kwargs['cfg_strength']
-        
+
         cond_output = self.estimator(t, x, mask, mu, c)
         uncond_output = self.estimator(t, x, mask, fake_content, fake_speaker)
-        
+
         output = uncond_output + cfg_strength * (cond_output - uncond_output)
         return output
 
@@ -137,7 +145,7 @@ class CFMDecoder(torch.nn.Module):
         # use cosine timestep scheduler from cosyvoice: https://github.com/FunAudioLLM/CosyVoice/blob/main/cosyvoice/flow/flow_matching.py
         t = torch.rand([b, 1, 1], device=mu.device, dtype=mu.dtype)
         t = 1 - torch.cos(t * 0.5 * torch.pi)
-        
+
         # sample noise p(x_0)
         z = torch.randn_like(x1)
 

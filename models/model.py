@@ -38,15 +38,15 @@ class StableTTS(nn.Module):
         self.ref_encoder = MelStyleEncoder(mel_channels, style_vector_dim=gin_channels, style_kernel_size=5, dropout=0.25)
         self.dp = DurationPredictor(hidden_channels, filter_channels, kernel_size, 0.5, gin_channels)
         self.decoder = CFMDecoder(mel_channels, mel_channels, hidden_channels, mel_channels, filter_channels, n_heads, n_dec_layers, kernel_size, p_dropout, gin_channels)
-        
+
         # uncondition input for cfg
         self.fake_speaker = nn.Parameter(torch.zeros(1, gin_channels))
         self.fake_content = nn.Parameter(torch.zeros(1, mel_channels, 1))
-        
+
         self.cfg_dropout = 0.2
 
     @torch.inference_mode()
-    def synthesise(self, x, x_lengths, n_timesteps, temperature=1.0, y=None, length_scale=1.0, solver=None, cfg=1.0, prefix=None, postfix=None, prefix_text=None, suffix_text=None):
+    def synthesise(self, x, x_lengths, n_timesteps, temperature=1.0, y=None, length_scale=1.0, solver=None, cfg=1.0, prefix=None, postfix=None, prefix_text=None, suffix_text=None, blend_opts=None):
         """
         Generates mel-spectrogram from text. Returns:
             1. encoder outputs
@@ -81,7 +81,7 @@ class StableTTS(nn.Module):
             x = torch.cat([prefix_text, x], dim=-1)
             x_lengths = x_lengths + prefix_text.size(-1)
 
-        if suffix_text is not None: 
+        if suffix_text is not None:
             x = torch.cat([x, suffix_text], dim=-1)
             x_lengths = x_lengths + suffix_text.size(-1)
 
@@ -105,7 +105,7 @@ class StableTTS(nn.Module):
         mu_y = mu_y.transpose(1, 2)
         encoder_outputs = mu_y[:, :, :y_max_length]
 
-        
+
         #do the suffix first so that the mu_y indexes are correct for the prefix.
         if suffix_text is not None:
             #now need to figure out where the suffix text starts so that we can trim it off.
@@ -137,7 +137,7 @@ class StableTTS(nn.Module):
             #now figure out where in the y dimension that is.
             attn_sliced = attn[0, 0, p_length, : ]
             non_zero_indeces = (attn_sliced != 0).nonzero(as_tuple=True)[0]
-    
+
 
             #now split the mu_y, p_mu_y out from eachother.
             assert non_zero_indeces.numel() > 0, "Didn't find prefix text in alignment map"
@@ -156,11 +156,11 @@ class StableTTS(nn.Module):
 
         # Generate sample tracing the probability flow
         if cfg == 1.0:
-            decoder_outputs = self.decoder(mu_y, y_mask, n_timesteps, temperature, c, solver, prefix=prefix, postfix=postfix, p_mu=p_mu_y, p_mask=p_y_mask, s_mu=s_mu_y, s_mask=s_y_mask)
+            decoder_outputs = self.decoder(mu_y, y_mask, n_timesteps, temperature, c, solver, prefix=prefix, postfix=postfix, p_mu=p_mu_y, p_mask=p_y_mask, s_mu=s_mu_y, s_mask=s_y_mask, blend_opts=blend_opts)
         else:
             cfg_kwargs = {'fake_speaker': self.fake_speaker, 'fake_content': self.fake_content, 'cfg_strength': cfg}
-            decoder_outputs = self.decoder(mu_y, y_mask, n_timesteps, temperature, c, solver, cfg_kwargs, prefix=prefix, postfix=postfix, p_mu=p_mu_y, p_mask=p_y_mask, s_mu=s_mu_y, s_mask=s_y_mask)
-            
+            decoder_outputs = self.decoder(mu_y, y_mask, n_timesteps, temperature, c, solver, cfg_kwargs, prefix=prefix, postfix=postfix, p_mu=p_mu_y, p_mask=p_y_mask, s_mu=s_mu_y, s_mask=s_y_mask, blend_opts=blend_opts)
+
         if prefix is None and postfix is None:
             #The length is extended for the prefix and postfix and instead of just trying
             #to figure out what the new length is, I am just going to not trim it.
@@ -198,24 +198,24 @@ class StableTTS(nn.Module):
         y_mask = sequence_mask(y_lengths, y.size(2)).unsqueeze(1).to(y.dtype)
         z_mask = sequence_mask(z_lengths, z.size(2)).unsqueeze(1).to(z.dtype)
         cfg_mask = torch.rand(y.size(0), 1, device=y.device) > self.cfg_dropout
-        
+
         # compute global speaker embedding
         c = self.ref_encoder(z, z_mask)  * cfg_mask + ~cfg_mask * self.fake_speaker.repeat(z.size(0), 1)
-        
+
         x, mu_x, x_mask = self.encoder(x, c, x_lengths)
         logw = self.dp(x, x_mask, c)
-        
+
         attn_mask = x_mask.unsqueeze(-1) * y_mask.unsqueeze(2)
-        
+
         # Use MAS to find most likely alignment `attn` between text and mel-spectrogram
         with torch.no_grad():
             s_p_sq_r = torch.ones_like(mu_x) # [b, d, t]
             neg_cent1 = torch.sum(-0.5 * math.log(2 * math.pi)- torch.zeros_like(mu_x), [1], keepdim=True)
             neg_cent2 = torch.einsum("bdt, bds -> bts", -0.5 * (y**2), s_p_sq_r)
             neg_cent3 = torch.einsum("bdt, bds -> bts", y, (mu_x * s_p_sq_r))
-            neg_cent4 = torch.sum(-0.5 * (mu_x**2) * s_p_sq_r, [1], keepdim=True)  
+            neg_cent4 = torch.sum(-0.5 * (mu_x**2) * s_p_sq_r, [1], keepdim=True)
             neg_cent = neg_cent1 + neg_cent2 + neg_cent3 + neg_cent4
-            
+
             attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)
             attn = (monotonic_align.maximum_path(neg_cent, attn_mask.squeeze(1)).unsqueeze(1).detach())
 
@@ -233,7 +233,7 @@ class StableTTS(nn.Module):
         cfg_mask = cfg_mask.unsqueeze(-1)
         mu_y_masked = mu_y  * cfg_mask + ~cfg_mask * self.fake_content.repeat(mu_y.size(0), 1, mu_y.size(-1)) # mask content information for better diversity for flow-matching
         diff_loss, _ = self.decoder.compute_loss(y, y_mask, mu_y_masked, c)
-        
+
         prior_loss = torch.sum(0.5 * ((y - mu_y) ** 2 + math.log(2 * math.pi)) * y_mask)
         prior_loss = prior_loss / (torch.sum(y_mask) * self.mel_channels)
 

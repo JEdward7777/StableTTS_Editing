@@ -65,7 +65,7 @@ class StableTTSAPI(nn.Module):
 
     @ torch.inference_mode()
     def inference(self, text, ref_audio, language, step, temperature=1.0, length_scale=1.0, solver=None, cfg=3.0, prefix=None, postfix=None,
-                  prefix_text=None, suffix_text=None):
+                  prefix_text=None, suffix_text=None, blend_opts=None):
         device = next(self.parameters()).device
         phonemizer = self.g2p_mapping.get(language)
 
@@ -102,7 +102,7 @@ class StableTTSAPI(nn.Module):
             suffix_text = phonemizer(suffix_text)
             suffix_text = torch.tensor(intersperse(cleaned_text_to_sequence(suffix_text), item=0), dtype=torch.long, device=device).unsqueeze(0)
 
-        mel_output = self.tts_model.synthesise(text, text_length, step, temperature, ref_audio, length_scale, solver, cfg, prefix=prefix, postfix=postfix, prefix_text=prefix_text, suffix_text=suffix_text)['decoder_outputs']
+        mel_output = self.tts_model.synthesise(text, text_length, step, temperature, ref_audio, length_scale, solver, cfg, prefix=prefix, postfix=postfix, prefix_text=prefix_text, suffix_text=suffix_text, blend_opts=blend_opts)['decoder_outputs']
 
         #josh_hacking.plot_mel_spectrogram(mel_output, self.mel_config)
 

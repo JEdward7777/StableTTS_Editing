@@ -11,7 +11,6 @@ os.environ['TMPDIR'] = './temps'  # avoid the system default temp folder not hav
 
 import re
 import numpy as np
-
 import matplotlib.pyplot as plt
 
 import torch
@@ -29,7 +28,8 @@ except ImportError:
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-tts_model_path = './checkpoints/checkpoint_0.pt'
+#tts_model_path = './checkpoints/checkpoint_0.pt'
+tts_model_path = './checkpoints/checkpoint_josh.pt'
 vocoder_model_path = './vocoders/pretrained/firefly-gan-base-generator.ckpt'
 vocoder_type = 'ffgan'
 whisper_model_name = "tiny.en"
@@ -47,14 +47,71 @@ def transcribe(audio):
     return transcription['text']
 
 
+def apply_mel_crossfade(mel_output, prefix_mel, suffix_mel, crossfade_frames):
+    """
+    Apply post-generation mel crossfade at prefix/suffix boundaries.
+
+    Linearly blends the original mel (from prefix/suffix) with the generated mel
+    at the boundaries over `crossfade_frames` frames.
+
+    Args:
+        mel_output: generated mel tensor (1, n_mels, total_frames)
+        prefix_mel: original prefix mel tensor or None
+        suffix_mel: original suffix mel tensor or None
+        crossfade_frames: number of frames to crossfade over
+
+    Returns:
+        mel_output with crossfade applied at boundaries
+    """
+    if crossfade_frames <= 0:
+        return mel_output
+
+    mel_output = mel_output.clone()
+
+    if prefix_mel is not None:
+        prefix_len = prefix_mel.shape[-1]
+        n_fade = min(crossfade_frames, prefix_len, mel_output.shape[-1] - prefix_len)
+        if n_fade > 0:
+            # Linear ramp: at the boundary, blend from original (weight=1) to generated (weight=1)
+            # The prefix region is already the original audio; we fade the transition
+            fade_start = prefix_len  # start of generated region
+            ramp = torch.linspace(1, 0, n_fade, device=mel_output.device).unsqueeze(0).unsqueeze(0)
+            # Blend: generated * (1-ramp) + original_tail * ramp
+            original_tail = prefix_mel[:, :, -n_fade:].to(mel_output.device)
+            mel_output[:, :, fade_start:fade_start + n_fade] = (
+                mel_output[:, :, fade_start:fade_start + n_fade] * (1 - ramp) +
+                original_tail * ramp
+            )
+
+    if suffix_mel is not None:
+        suffix_len = suffix_mel.shape[-1]
+        total_len = mel_output.shape[-1]
+        suffix_start = total_len - suffix_len
+        n_fade = min(crossfade_frames, suffix_len, suffix_start)
+        if n_fade > 0:
+            # Fade at the end of generated region into the suffix
+            fade_end = suffix_start  # end of generated region
+            ramp = torch.linspace(0, 1, n_fade, device=mel_output.device).unsqueeze(0).unsqueeze(0)
+            # Blend: generated * (1-ramp) + original_head * ramp
+            original_head = suffix_mel[:, :, :n_fade].to(mel_output.device)
+            mel_output[:, :, fade_end - n_fade:fade_end] = (
+                mel_output[:, :, fade_end - n_fade:fade_end] * (1 - ramp) +
+                original_head * ramp
+            )
+
+    return mel_output
+
+
 @torch.inference_mode()
-def inference(original_text, edited_text, reference_audio, language, step, temperature, length_scale, solver, cfg):
+def inference(original_text, edited_text, reference_audio, language, step, temperature,
+              length_scale, solver, cfg, enable_mask_feather, enable_mel_crossfade, feather_frames):
     """
     Full MAS-alignment-based inpainting pipeline:
     1. Align original text to reference audio (get word boundaries via MAS)
     2. Diff original vs edited text (find prefix/suffix split points)
     3. Slice mel spectrogram at boundaries
     4. Generate only the edited portion using CFM decoder with prefix/suffix context
+    5. Optionally apply blending (mask feathering and/or mel crossfade)
     """
     if reference_audio is None:
         raise gr.Error("Please provide reference audio.")
@@ -93,9 +150,13 @@ def inference(original_text, edited_text, reference_audio, language, step, tempe
     prefix_mel = mel[:, :, :prefix_end_frame] if prefix_end_frame > 0 else None
     suffix_mel = mel[:, :, suffix_start_frame:] if suffix_start_frame < total_mel_frames else None
 
-    # --- Step 4: Generate using the existing inference pipeline ---
-    # Pass mel tensors directly (api.py now accepts tensors via isinstance checks)
-    # Also pass prefix_text/suffix_text for prosodic conditioning
+    # --- Step 4: Build blend_opts dictionary ---
+    blend_opts = {}
+    feather_frames_int = int(feather_frames)
+    if enable_mask_feather and feather_frames_int > 0:
+        blend_opts['mask_feather_frames'] = feather_frames_int
+
+    # --- Step 5: Generate using the existing inference pipeline ---
     audio_output, mel_output = model.inference(
         edited_portion,
         mel,  # reference audio as mel tensor (for speaker embedding)
@@ -109,7 +170,15 @@ def inference(original_text, edited_text, reference_audio, language, step, tempe
         postfix=suffix_mel,
         prefix_text=prefix_text if prefix_text else None,
         suffix_text=suffix_text if suffix_text else None,
+        blend_opts=blend_opts if blend_opts else None,
     )
+
+    # --- Step 6: Apply post-generation mel crossfade if enabled ---
+    if enable_mel_crossfade and feather_frames_int > 0:
+        mel_output = apply_mel_crossfade(mel_output, prefix_mel, suffix_mel, feather_frames_int)
+        # Re-vocode the blended mel
+        audio_output = model.vocoder_model(mel_output.to(device))
+        audio_output = audio_output.cpu()
 
     max_val = torch.max(torch.abs(audio_output))
     if max_val > 1:
@@ -124,7 +193,7 @@ def inference(original_text, edited_text, reference_audio, language, step, tempe
     )
 
     # Generate alignment debug info
-    alignment_info = format_alignment_info(word_boundaries, edit_info)
+    alignment_info = format_alignment_info(word_boundaries, edit_info, blend_opts, enable_mel_crossfade, feather_frames_int)
 
     return audio_result, mel_plot, alignment_plot, alignment_info
 
@@ -149,7 +218,7 @@ def plot_alignment_matrix(attn, phonemes, word_boundaries, edit_info):
     with word boundaries and edit regions marked.
 
     Args:
-        attn: alignment matrix tensor (1, 1, interspersed_text_length, mel_length)
+        attn: alignment matrix tensor (1, 1, mel_length, interspersed_text_length)
         phonemes: list of phoneme characters from G2P
         word_boundaries: list of word boundary dicts
         edit_info: output from compute_edit_regions()
@@ -157,8 +226,10 @@ def plot_alignment_matrix(attn, phonemes, word_boundaries, edit_info):
     plt.close()  # prevent memory leak
 
     # Extract the alignment matrix as numpy
-    # attn shape: (1, 1, text_tokens, mel_frames)
-    attn_np = attn.squeeze(0).squeeze(0).cpu().numpy()  # (text_tokens, mel_frames)
+    # attn shape: (1, 1, mel_frames, text_tokens)
+    # Transpose to (text_tokens, mel_frames) for display with phonemes on Y and time on X
+    attn_np = attn.squeeze(0).squeeze(0).cpu().numpy()  # (mel_frames, text_tokens)
+    attn_np = attn_np.T  # (text_tokens, mel_frames)
 
     fig, ax = plt.subplots(figsize=(20, 8))
 
@@ -170,7 +241,7 @@ def plot_alignment_matrix(attn, phonemes, word_boundaries, edit_info):
     ax.set_ylabel('Phoneme Tokens', fontsize=12)
     ax.set_title('MAS Alignment Matrix (phoneme × mel frame)', fontsize=14)
 
-    # Add phoneme labels on Y-axis (show every Nth for readability)
+    # Add phoneme labels on Y-axis
     # Build interspersed phoneme labels: [_, p0, _, p1, _, p2, ...]
     interspersed_labels = []
     for i in range(attn_np.shape[0]):
@@ -197,16 +268,13 @@ def plot_alignment_matrix(attn, phonemes, word_boundaries, edit_info):
 
     # Draw horizontal lines at word boundaries
     for wb in word_boundaries:
-        # Word starts at interspersed token index 2 * phoneme_start
         token_y = 2 * wb.get('phoneme_start', 0) if 'phoneme_start' in wb else None
         if token_y is not None:
             ax.axhline(y=token_y - 0.5, color='cyan', linewidth=0.5, alpha=0.7)
 
     # Draw vertical lines at word frame boundaries and label words
     for wb in word_boundaries:
-        # Vertical line at word start frame
         ax.axvline(x=wb['start_frame'], color='cyan', linewidth=0.5, alpha=0.5, linestyle='--')
-        # Word label at the midpoint
         mid_frame = (wb['start_frame'] + wb['end_frame']) / 2
         ax.text(mid_frame, -2, wb['word'], ha='center', va='top', fontsize=8,
                 color='white', fontweight='bold',
@@ -216,21 +284,17 @@ def plot_alignment_matrix(attn, phonemes, word_boundaries, edit_info):
     if edit_info['has_edit']:
         prefix_end = edit_info['prefix_end_frame']
         suffix_start = edit_info['suffix_start_frame']
-        # Draw vertical bands for the edit region
         ax.axvspan(prefix_end, suffix_start, alpha=0.15, color='red', label='Edit region')
         ax.axvline(x=prefix_end, color='lime', linewidth=2, linestyle='-', alpha=0.8, label='Prefix end')
         ax.axvline(x=suffix_start, color='lime', linewidth=2, linestyle='-', alpha=0.8, label='Suffix start')
 
     ax.legend(loc='upper right', fontsize=9)
-
-    # Add colorbar
     plt.colorbar(im, ax=ax, fraction=0.02, pad=0.01)
-
     fig.tight_layout()
     return fig
 
 
-def format_alignment_info(word_boundaries, edit_info):
+def format_alignment_info(word_boundaries, edit_info, blend_opts, mel_crossfade_enabled, feather_frames):
     """Format alignment and edit info as debug text."""
     lines = ["## Word Boundaries (MAS Alignment)", ""]
     lines.append("| Word | Start (s) | End (s) | Frames |")
@@ -249,8 +313,16 @@ def format_alignment_info(word_boundaries, edit_info):
     lines.append(f"- **Prefix end frame:** {edit_info['prefix_end_frame']}")
     lines.append(f"- **Suffix start frame:** {edit_info['suffix_start_frame']}")
 
+    lines.append("")
+    lines.append("## Blending Settings")
+    mask_feather = blend_opts.get('mask_feather_frames', 0) if blend_opts else 0
+    lines.append(f"- **Mask feathering:** {'ON' if mask_feather > 0 else 'OFF'} ({mask_feather} frames)")
+    lines.append(f"- **Mel crossfade:** {'ON' if mel_crossfade_enabled else 'OFF'} ({feather_frames} frames)")
+
     return "\n".join(lines)
 
+
+# --- Gradio UI ---
 
 gui_title = 'StableTTS — MAS Alignment'
 gui_description = """Audio inpainting using StableTTS's built-in Monotonic Alignment Search for word boundary detection.
@@ -334,6 +406,30 @@ with gr.Blocks(theme=gr.themes.Base()) as demo:
                 value=3,
             )
 
+            # --- Blending Controls ---
+            gr.Markdown("### Blending Options")
+
+            enable_mask_feather_gr = gr.Checkbox(
+                label="Enable Mask Feathering (during generation)",
+                info="Applies a gradient ramp to the CFM decoder mask at prefix/suffix boundaries",
+                value=False,
+            )
+
+            enable_mel_crossfade_gr = gr.Checkbox(
+                label="Enable Mel Crossfade (post-generation)",
+                info="Linearly blends original and generated mel at boundaries after generation",
+                value=False,
+            )
+
+            feather_frames_gr = gr.Slider(
+                label='Feather/Crossfade Width (frames)',
+                info="Number of frames for the gradient ramp (shared by both approaches)",
+                minimum=0,
+                maximum=50,
+                value=5,
+                step=1
+            )
+
         with gr.Column():
             mel_gr = gr.Plot(label="Mel Spectrogram")
             audio_gr = gr.Audio(label="Synthesised Audio", autoplay=True)
@@ -344,7 +440,8 @@ with gr.Blocks(theme=gr.themes.Base()) as demo:
 
     tts_button.click(
         inference,
-        [original_text_gr, edited_text_gr, ref_audio_gr, language_gr, step_gr, temperature_gr, length_scale_gr, solver_gr, cfg_gr],
+        [original_text_gr, edited_text_gr, ref_audio_gr, language_gr, step_gr, temperature_gr,
+         length_scale_gr, solver_gr, cfg_gr, enable_mask_feather_gr, enable_mel_crossfade_gr, feather_frames_gr],
         outputs=[audio_gr, mel_gr, alignment_plot_gr, alignment_info_gr]
     )
 
