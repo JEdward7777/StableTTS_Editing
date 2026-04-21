@@ -227,42 +227,45 @@ class CFMDecoder(torch.nn.Module):
     def _build_repaint_schedule(self, n_timesteps, jump_length, jump_n_sample):
         """Build a step schedule with resampling jumps.
 
-        Creates a schedule like: 0,1,2,3,4,5, 3,4,5, 3,4,5, 6,7,8,9,10, 8,9,10, 8,9,10, ...
-        At every jump_length steps, we jump back and resample jump_n_sample times.
+        Every jump_length forward steps, we jump back by jump_length steps and
+        redo them, repeating jump_n_sample times total (including the first pass).
+
+        Example with n_timesteps=12, jump_length=3, jump_n_sample=2:
+          Forward: 0→1→2→3, jump back: 3→0, redo: 0→1→2→3,
+          Forward: 3→4→5→6, jump back: 6→3, redo: 3→4→5→6,
+          Forward: 6→7→8→9, jump back: 9→6, redo: 6→7→8→9,
+          Forward: 9→10→11→12
+
+        The schedule as step indices: [0,1,2,3, 0,1,2,3, 3,4,5,6, 3,4,5,6, 6,7,8,9, 6,7,8,9, 9,10,11,12]
 
         Args:
             n_timesteps: total number of ODE steps
-            jump_length: how many steps to jump back
-            jump_n_sample: how many times to resample at each jump point
+            jump_length: how many steps forward before jumping back
+            jump_n_sample: total number of times to traverse each segment (including first)
 
         Returns:
-            list of step indices (into t_span)
+            list of step indices (into t_span). Consecutive pairs define transitions.
         """
-        schedule = []
+        schedule = [0]  # start at step 0
         current = 0
 
         while current < n_timesteps:
-            # Move forward by jump_length steps (or to the end)
             segment_end = min(current + jump_length, n_timesteps)
 
-            for step in range(current, segment_end + 1):
+            # First forward pass through this segment
+            for step in range(current + 1, segment_end + 1):
                 schedule.append(step)
 
+            # Resampling: jump back and redo (jump_n_sample - 1 additional times)
             if segment_end < n_timesteps:
-                # Do resampling: jump back and redo
-                for _ in range(jump_n_sample - 1):  # -1 because we already did one forward pass
-                    # Jump back
-                    jump_back_to = max(current, segment_end - jump_length)
-                    schedule.append(jump_back_to)
-                    # Redo forward
-                    for step in range(jump_back_to + 1, segment_end + 1):
+                for _ in range(jump_n_sample - 1):
+                    # Jump back to segment start
+                    schedule.append(current)
+                    # Redo forward through segment
+                    for step in range(current + 1, segment_end + 1):
                         schedule.append(step)
 
             current = segment_end
-
-        # Make sure we end at n_timesteps
-        if schedule[-1] != n_timesteps:
-            schedule.append(n_timesteps)
 
         return schedule
 
