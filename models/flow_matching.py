@@ -25,7 +25,12 @@ class CFMDecoder(torch.nn.Module):
 
     @torch.inference_mode()
     def forward(self, mu, mask, n_timesteps, temperature=1.0, c=None, solver=None, cfg_kwargs=None, prefix=None, postfix=None, p_mu=None, p_mask=None, s_mu=None, s_mask=None, blend_opts=None):
-        """Forward diffusion
+        """Forward diffusion with RePaint-style inpainting for prefix/postfix regions.
+
+        When prefix and/or postfix mel spectrograms are provided, uses a RePaint-style
+        approach: at each ODE step, the known (prefix/postfix) regions are re-injected
+        at the appropriate noise level, forcing the generated region to be coherent with
+        the boundary context at every scale.
 
         Args:
             mu (torch.Tensor): output of encoder
@@ -36,11 +41,18 @@ class CFMDecoder(torch.nn.Module):
             temperature (float, optional): temperature for scaling noise. Defaults to 1.0.
             c (torch.Tensor, optional): speaker embedding
                 shape: (batch_size, gin_channels)
-            solver: see https://github.com/rtqichen/torchdiffeq for supported solvers
+            solver: ODE solver method (used only when no prefix/postfix; ignored for RePaint loop)
             cfg_kwargs: used for cfg inference
-            blend_opts (dict, optional): blending/feathering options. Keys:
-                - 'mask_feather_frames' (int): number of frames to feather at prefix/postfix boundaries.
-                  Creates a linear ramp from 0→1 at the edge of the mask. Default: 0 (no feathering).
+            prefix (torch.Tensor, optional): prefix mel spectrogram (known audio before edit)
+            postfix (torch.Tensor, optional): postfix mel spectrogram (known audio after edit)
+            p_mu (torch.Tensor, optional): encoder output for prefix text
+            p_mask (torch.Tensor, optional): mask for prefix
+            s_mu (torch.Tensor, optional): encoder output for suffix text
+            s_mask (torch.Tensor, optional): mask for suffix
+            blend_opts (dict, optional): blending/RePaint options. Keys:
+                - 'repaint_jumps' (bool): enable resampling jumps. Default: False.
+                - 'jump_length' (int): how many steps to jump back. Default: 3.
+                - 'jump_n_sample' (int): how many resample iterations per jump. Default: 3.
 
         Returns:
             sample: generated mel-spectrogram
@@ -48,67 +60,211 @@ class CFMDecoder(torch.nn.Module):
         """
         if blend_opts is None:
             blend_opts = {}
-        mask_feather_frames = blend_opts.get('mask_feather_frames', 0)
 
+        has_inpaint = prefix is not None or postfix is not None
+
+        if has_inpaint:
+            return self._forward_repaint(
+                mu, mask, n_timesteps, temperature, c, cfg_kwargs,
+                prefix, postfix, p_mu, p_mask, s_mu, s_mask, blend_opts
+            )
+        else:
+            return self._forward_standard(
+                mu, mask, n_timesteps, temperature, c, solver, cfg_kwargs
+            )
+
+    def _forward_standard(self, mu, mask, n_timesteps, temperature, c, solver, cfg_kwargs):
+        """Standard ODE-based forward pass (no inpainting)."""
         z = torch.randn_like(mu) * temperature
-        #This code doesn't work for batches yet because the mask isn't used and the prefixes are not probably going to be right justified.
-        if prefix is not None:
-            z = torch.cat((prefix, z), dim=-1)
-            if p_mu is None:
-                mu = torch.cat((prefix*0, mu), dim=-1)
-            else:
-                if prefix.shape[-1] > p_mu.shape[-1]:
-                    #just pad p_mu with zeros.
-                    p_mu = torch.cat((torch.zeros(*p_mu.shape[:-1], prefix.shape[-1]-p_mu.shape[-1], device=p_mu.device), p_mu), dim=-1)
-                else:
-                    #slice p_mu to match prefix loseing the front side.
-                    p_mu = p_mu[:, :, p_mu.shape[-1]-prefix.shape[-1]:]
-                mu = torch.cat((p_mu, mu), dim=-1)
-
-            prefix_mask = torch.zeros(*mask.shape[:-1], prefix.shape[-1], device=mask.device)
-            # Apply feathering: linear ramp from 0→1 at the end of the prefix mask
-            if mask_feather_frames > 0:
-                n_feather = min(mask_feather_frames, prefix.shape[-1])
-                ramp = torch.linspace(0, 1, n_feather + 2, device=mask.device)[1:-1]  # exclude 0 and 1
-                prefix_mask[:, :, -n_feather:] = ramp
-
-            mask = torch.cat((prefix_mask, mask), dim=-1)
-
-        if postfix is not None:
-            z = torch.cat((z, postfix), dim=-1)
-            if s_mu is None:
-                mu = torch.cat((mu, postfix*0), dim=-1)
-            else:
-                if postfix.shape[-1] > s_mu.shape[-1]:
-                    #just pad s_mu with zeros.
-                    s_mu = torch.cat((s_mu, torch.zeros(*s_mu.shape[:-1], postfix.shape[-1]-s_mu.shape[-1], device=s_mu.device)), dim=-1)
-                else:
-                    #slice s_mu to match postfix loseing the back side.
-                    s_mu = s_mu[:, :, 0:postfix.shape[-1]]
-                mu = torch.cat((mu, s_mu), dim=-1)
-            postfix_mask = torch.zeros(*mask.shape[:-1], postfix.shape[-1], device=mask.device)
-            # Apply feathering: linear ramp from 1→0 at the start of the postfix mask
-            if mask_feather_frames > 0:
-                n_feather = min(mask_feather_frames, postfix.shape[-1])
-                ramp = torch.linspace(1, 0, n_feather + 2, device=mask.device)[1:-1]  # exclude 1 and 0
-                postfix_mask[:, :, :n_feather] = ramp
-            mask = torch.cat((mask, postfix_mask), dim=-1)
-
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device)
 
-        # cfg control
         if cfg_kwargs is None:
             estimator = functools.partial(self.estimator, mask=mask, mu=mu, c=c)
         else:
             estimator = functools.partial(self.cfg_wrapper, mask=mask, mu=mu, c=c, cfg_kwargs=cfg_kwargs)
 
         trajectory = odeint(estimator, z, t_span, method=solver, rtol=1e-5, atol=1e-5)
-
-        # for i in range( trajectory.shape[0] ):
-        #     josh_hacking.plot_mel_spectrogram(trajectory[i], filename=f"trajectory_{i}.png")
-
-
         return trajectory[-1]
+
+    def _forward_repaint(self, mu, mask, n_timesteps, temperature, c, cfg_kwargs,
+                         prefix, postfix, p_mu, p_mask, s_mu, s_mask, blend_opts):
+        """RePaint-style forward pass with known-region re-injection at each step.
+
+        Instead of freezing prefix/postfix with a zero-velocity mask, this approach:
+        1. Starts everything as noise
+        2. At each ODE step, computes velocity for ALL frames (model sees full context)
+        3. After each step, replaces known regions with the correct interpolation
+           between noise and original audio at the current time t
+        4. Optionally performs resampling jumps for better boundary coherence
+
+        Reference: RePaint (Lugmayr et al., 2022) - https://arxiv.org/abs/2201.09865
+        Adapted from DDPM to Conditional Flow Matching.
+        """
+        repaint_jumps = blend_opts.get('repaint_jumps', False)
+        jump_length = blend_opts.get('jump_length', 3)
+        jump_n_sample = blend_opts.get('jump_n_sample', 3)
+
+        # --- Build the full concatenated sequence ---
+        # Generate noise for the editable region
+        z_edit = torch.randn_like(mu) * temperature
+
+        # Track prefix/suffix lengths for re-injection
+        prefix_len = prefix.shape[-1] if prefix is not None else 0
+        postfix_len = postfix.shape[-1] if postfix is not None else 0
+
+        # Build full mu (encoder conditioning) by concatenating prefix_mu + edit_mu + suffix_mu
+        full_mu = self._build_full_mu(mu, prefix, postfix, p_mu, s_mu)
+
+        # Build full mask (all 1's — model sees everything in RePaint)
+        full_mask = torch.ones(*mask.shape[:-1], prefix_len + mu.shape[-1] + postfix_len, device=mask.device)
+
+        # Store the original clean mel for known regions
+        # and the initial noise we'll use for re-injection
+        original_prefix = prefix  # clean mel
+        original_postfix = postfix  # clean mel
+
+        # Generate noise for the known regions (same noise used throughout for consistency)
+        noise_prefix = torch.randn_like(prefix) * temperature if prefix is not None else None
+        noise_postfix = torch.randn_like(postfix) * temperature if postfix is not None else None
+
+        # Build the full initial state: noise everywhere
+        z_parts = []
+        if prefix is not None:
+            z_parts.append(noise_prefix)
+        z_parts.append(z_edit)
+        if postfix is not None:
+            z_parts.append(noise_postfix)
+        z = torch.cat(z_parts, dim=-1)
+
+        # Build the estimator function (with full mask and full mu)
+        if cfg_kwargs is None:
+            estimator_fn = functools.partial(self.estimator, mask=full_mask, mu=full_mu, c=c)
+        else:
+            estimator_fn = functools.partial(self.cfg_wrapper, mask=full_mask, mu=full_mu, c=c, cfg_kwargs=cfg_kwargs)
+
+        # --- RePaint stepping loop ---
+        t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device)
+
+        # Build the schedule of steps, including resampling jumps if enabled
+        if repaint_jumps and jump_length > 0 and jump_n_sample > 0:
+            step_schedule = self._build_repaint_schedule(n_timesteps, jump_length, jump_n_sample)
+        else:
+            # Simple forward schedule: 0, 1, 2, ..., n_timesteps
+            step_schedule = list(range(n_timesteps + 1))
+
+        # Walk through the schedule
+        current_step_idx = 0
+        i = 0
+        while i < len(step_schedule) - 1:
+            current_step = step_schedule[i]
+            next_step = step_schedule[i + 1]
+
+            t_current = t_span[current_step]
+            t_next = t_span[next_step]
+
+            if next_step > current_step:
+                # Forward step (denoising): t_current → t_next (t increases)
+                dt = t_next - t_current
+                velocity = estimator_fn(t_current, z)
+                z = z + dt * velocity
+            else:
+                # Backward step (re-noising): t_current → t_next (t decreases, i.e., add noise)
+                # In flow matching: x_t = (1-t)*x_0 + t*x_1
+                # To go from t_current to t_next (where t_next < t_current),
+                # we re-derive z at t_next from the current estimate of x_1
+                # Current best estimate of clean signal: z at t_current ≈ x_1 (approximately)
+                # But we need to add noise back. We use the flow matching interpolation:
+                # z_t_next = (1 - t_next) * noise_original + t_next * z_current_estimate
+                # where noise_original is the noise we started with
+                # This is a simplification — we re-noise using the original noise
+                z_edit_region = z[:, :, prefix_len:prefix_len + mu.shape[-1]]
+                z_edit_renoised = (1 - t_next) * z_edit[: , :, :] + t_next * z_edit_region
+                z[:, :, prefix_len:prefix_len + mu.shape[-1]] = z_edit_renoised
+
+            # Re-inject known regions at the current noise level
+            # In flow matching: x_t = (1-t)*x_0 + t*x_1
+            # where x_0 is noise, x_1 is clean signal
+            t_inject = t_next
+            if prefix is not None:
+                known_at_t = (1 - t_inject) * noise_prefix + t_inject * original_prefix
+                z[:, :, :prefix_len] = known_at_t
+            if postfix is not None:
+                known_at_t = (1 - t_inject) * noise_postfix + t_inject * original_postfix
+                z[:, :, -postfix_len:] = known_at_t
+
+            i += 1
+
+        return z
+
+    def _build_full_mu(self, mu, prefix, postfix, p_mu, s_mu):
+        """Build the full encoder conditioning tensor by concatenating prefix/edit/suffix mu."""
+        parts = []
+
+        if prefix is not None:
+            if p_mu is None:
+                parts.append(prefix * 0)  # zero conditioning for prefix
+            else:
+                if prefix.shape[-1] > p_mu.shape[-1]:
+                    p_mu = torch.cat((torch.zeros(*p_mu.shape[:-1], prefix.shape[-1] - p_mu.shape[-1], device=p_mu.device), p_mu), dim=-1)
+                else:
+                    p_mu = p_mu[:, :, p_mu.shape[-1] - prefix.shape[-1]:]
+                parts.append(p_mu)
+
+        parts.append(mu)
+
+        if postfix is not None:
+            if s_mu is None:
+                parts.append(postfix * 0)  # zero conditioning for postfix
+            else:
+                if postfix.shape[-1] > s_mu.shape[-1]:
+                    s_mu = torch.cat((s_mu, torch.zeros(*s_mu.shape[:-1], postfix.shape[-1] - s_mu.shape[-1], device=s_mu.device)), dim=-1)
+                else:
+                    s_mu = s_mu[:, :, 0:postfix.shape[-1]]
+                parts.append(s_mu)
+
+        return torch.cat(parts, dim=-1)
+
+    def _build_repaint_schedule(self, n_timesteps, jump_length, jump_n_sample):
+        """Build a step schedule with resampling jumps.
+
+        Creates a schedule like: 0,1,2,3,4,5, 3,4,5, 3,4,5, 6,7,8,9,10, 8,9,10, 8,9,10, ...
+        At every jump_length steps, we jump back and resample jump_n_sample times.
+
+        Args:
+            n_timesteps: total number of ODE steps
+            jump_length: how many steps to jump back
+            jump_n_sample: how many times to resample at each jump point
+
+        Returns:
+            list of step indices (into t_span)
+        """
+        schedule = []
+        current = 0
+
+        while current < n_timesteps:
+            # Move forward by jump_length steps (or to the end)
+            segment_end = min(current + jump_length, n_timesteps)
+
+            for step in range(current, segment_end + 1):
+                schedule.append(step)
+
+            if segment_end < n_timesteps:
+                # Do resampling: jump back and redo
+                for _ in range(jump_n_sample - 1):  # -1 because we already did one forward pass
+                    # Jump back
+                    jump_back_to = max(current, segment_end - jump_length)
+                    schedule.append(jump_back_to)
+                    # Redo forward
+                    for step in range(jump_back_to + 1, segment_end + 1):
+                        schedule.append(step)
+
+            current = segment_end
+
+        # Make sure we end at n_timesteps
+        if schedule[-1] != n_timesteps:
+            schedule.append(n_timesteps)
+
+        return schedule
 
     # cfg inference
     def cfg_wrapper(self, t, x, mask, mu, c, cfg_kwargs):

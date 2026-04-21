@@ -3,6 +3,7 @@ MAS Alignment App — Gradio UI for audio inpainting using StableTTS's
 built-in Monotonic Alignment Search instead of Whisper for word boundaries.
 
 Clone of streamlined_app.py with Whisper replaced by MAS alignment.
+Uses RePaint-style inpainting for boundary-coherent audio generation.
 See MAS_IMPLEMENTATION_PLAN.md for design details.
 """
 
@@ -47,71 +48,16 @@ def transcribe(audio):
     return transcription['text']
 
 
-def apply_mel_crossfade(mel_output, prefix_mel, suffix_mel, crossfade_frames):
-    """
-    Apply post-generation mel crossfade at prefix/suffix boundaries.
-
-    Linearly blends the original mel (from prefix/suffix) with the generated mel
-    at the boundaries over `crossfade_frames` frames.
-
-    Args:
-        mel_output: generated mel tensor (1, n_mels, total_frames)
-        prefix_mel: original prefix mel tensor or None
-        suffix_mel: original suffix mel tensor or None
-        crossfade_frames: number of frames to crossfade over
-
-    Returns:
-        mel_output with crossfade applied at boundaries
-    """
-    if crossfade_frames <= 0:
-        return mel_output
-
-    mel_output = mel_output.clone()
-
-    if prefix_mel is not None:
-        prefix_len = prefix_mel.shape[-1]
-        n_fade = min(crossfade_frames, prefix_len, mel_output.shape[-1] - prefix_len)
-        if n_fade > 0:
-            # Linear ramp: at the boundary, blend from original (weight=1) to generated (weight=1)
-            # The prefix region is already the original audio; we fade the transition
-            fade_start = prefix_len  # start of generated region
-            ramp = torch.linspace(1, 0, n_fade, device=mel_output.device).unsqueeze(0).unsqueeze(0)
-            # Blend: generated * (1-ramp) + original_tail * ramp
-            original_tail = prefix_mel[:, :, -n_fade:].to(mel_output.device)
-            mel_output[:, :, fade_start:fade_start + n_fade] = (
-                mel_output[:, :, fade_start:fade_start + n_fade] * (1 - ramp) +
-                original_tail * ramp
-            )
-
-    if suffix_mel is not None:
-        suffix_len = suffix_mel.shape[-1]
-        total_len = mel_output.shape[-1]
-        suffix_start = total_len - suffix_len
-        n_fade = min(crossfade_frames, suffix_len, suffix_start)
-        if n_fade > 0:
-            # Fade at the end of generated region into the suffix
-            fade_end = suffix_start  # end of generated region
-            ramp = torch.linspace(0, 1, n_fade, device=mel_output.device).unsqueeze(0).unsqueeze(0)
-            # Blend: generated * (1-ramp) + original_head * ramp
-            original_head = suffix_mel[:, :, :n_fade].to(mel_output.device)
-            mel_output[:, :, fade_end - n_fade:fade_end] = (
-                mel_output[:, :, fade_end - n_fade:fade_end] * (1 - ramp) +
-                original_head * ramp
-            )
-
-    return mel_output
-
-
 @torch.inference_mode()
 def inference(original_text, edited_text, reference_audio, language, step, temperature,
-              length_scale, solver, cfg, enable_mask_feather, enable_mel_crossfade, feather_frames):
+              length_scale, solver, cfg, enable_repaint_jumps, jump_length, jump_n_sample):
     """
-    Full MAS-alignment-based inpainting pipeline:
+    Full MAS-alignment-based inpainting pipeline with RePaint-style generation:
     1. Align original text to reference audio (get word boundaries via MAS)
     2. Diff original vs edited text (find prefix/suffix split points)
     3. Slice mel spectrogram at boundaries
-    4. Generate only the edited portion using CFM decoder with prefix/suffix context
-    5. Optionally apply blending (mask feathering and/or mel crossfade)
+    4. Generate using RePaint-style ODE loop with known-region re-injection
+    5. Optionally use resampling jumps for better boundary coherence
     """
     if reference_audio is None:
         raise gr.Error("Please provide reference audio.")
@@ -150,13 +96,14 @@ def inference(original_text, edited_text, reference_audio, language, step, tempe
     prefix_mel = mel[:, :, :prefix_end_frame] if prefix_end_frame > 0 else None
     suffix_mel = mel[:, :, suffix_start_frame:] if suffix_start_frame < total_mel_frames else None
 
-    # --- Step 4: Build blend_opts dictionary ---
+    # --- Step 4: Build blend_opts dictionary for RePaint ---
     blend_opts = {}
-    feather_frames_int = int(feather_frames)
-    if enable_mask_feather and feather_frames_int > 0:
-        blend_opts['mask_feather_frames'] = feather_frames_int
+    if enable_repaint_jumps:
+        blend_opts['repaint_jumps'] = True
+        blend_opts['jump_length'] = int(jump_length)
+        blend_opts['jump_n_sample'] = int(jump_n_sample)
 
-    # --- Step 5: Generate using the existing inference pipeline ---
+    # --- Step 5: Generate using the inference pipeline (now with RePaint) ---
     audio_output, mel_output = model.inference(
         edited_portion,
         mel,  # reference audio as mel tensor (for speaker embedding)
@@ -173,13 +120,6 @@ def inference(original_text, edited_text, reference_audio, language, step, tempe
         blend_opts=blend_opts if blend_opts else None,
     )
 
-    # --- Step 6: Apply post-generation mel crossfade if enabled ---
-    if enable_mel_crossfade and feather_frames_int > 0:
-        mel_output = apply_mel_crossfade(mel_output, prefix_mel, suffix_mel, feather_frames_int)
-        # Re-vocode the blended mel
-        audio_output = model.vocoder_model(mel_output.to(device))
-        audio_output = audio_output.cpu()
-
     max_val = torch.max(torch.abs(audio_output))
     if max_val > 1:
         audio_output = audio_output / max_val
@@ -193,7 +133,7 @@ def inference(original_text, edited_text, reference_audio, language, step, tempe
     )
 
     # Generate alignment debug info
-    alignment_info = format_alignment_info(word_boundaries, edit_info, blend_opts, enable_mel_crossfade, feather_frames_int)
+    alignment_info = format_alignment_info(word_boundaries, edit_info, blend_opts)
 
     return audio_result, mel_plot, alignment_plot, alignment_info
 
@@ -294,7 +234,7 @@ def plot_alignment_matrix(attn, phonemes, word_boundaries, edit_info):
     return fig
 
 
-def format_alignment_info(word_boundaries, edit_info, blend_opts, mel_crossfade_enabled, feather_frames):
+def format_alignment_info(word_boundaries, edit_info, blend_opts):
     """Format alignment and edit info as debug text."""
     lines = ["## Word Boundaries (MAS Alignment)", ""]
     lines.append("| Word | Start (s) | End (s) | Frames |")
@@ -314,21 +254,28 @@ def format_alignment_info(word_boundaries, edit_info, blend_opts, mel_crossfade_
     lines.append(f"- **Suffix start frame:** {edit_info['suffix_start_frame']}")
 
     lines.append("")
-    lines.append("## Blending Settings")
-    mask_feather = blend_opts.get('mask_feather_frames', 0) if blend_opts else 0
-    lines.append(f"- **Mask feathering:** {'ON' if mask_feather > 0 else 'OFF'} ({mask_feather} frames)")
-    lines.append(f"- **Mel crossfade:** {'ON' if mel_crossfade_enabled else 'OFF'} ({feather_frames} frames)")
+    lines.append("## RePaint Settings")
+    lines.append("- **Mode:** RePaint-style (known regions re-injected at each ODE step)")
+    repaint_jumps = blend_opts.get('repaint_jumps', False) if blend_opts else False
+    jump_length = blend_opts.get('jump_length', 0) if blend_opts else 0
+    jump_n_sample = blend_opts.get('jump_n_sample', 0) if blend_opts else 0
+    lines.append(f"- **Resampling jumps:** {'ON' if repaint_jumps else 'OFF'}")
+    if repaint_jumps:
+        lines.append(f"- **Jump length:** {jump_length} steps")
+        lines.append(f"- **Jump n_sample:** {jump_n_sample} iterations")
 
     return "\n".join(lines)
 
 
 # --- Gradio UI ---
 
-gui_title = 'StableTTS — MAS Alignment'
-gui_description = """Audio inpainting using StableTTS's built-in Monotonic Alignment Search for word boundary detection.
+gui_title = 'StableTTS — MAS Alignment + RePaint Inpainting'
+gui_description = """Audio inpainting using StableTTS's built-in Monotonic Alignment Search for word boundary detection,
+with RePaint-style generation for boundary-coherent audio.
 
 **Workflow:** Provide reference audio + original transcript → edit the text → Generate.
-The system aligns the original text to the audio using MAS, detects what changed, and regenerates only the edited portion."""
+The system aligns the original text to the audio using MAS, detects what changed, and regenerates only the edited portion.
+Known audio regions are re-injected at each ODE step so the model generates content that matches the boundary context."""
 
 with gr.Blocks(theme=gr.themes.Base()) as demo:
     demo.load(None, None, js="() => {const params = new URLSearchParams(window.location.search);if (!params.has('__theme')) {params.set('__theme', 'light');window.location.search = params.toString();}}")
@@ -372,7 +319,8 @@ with gr.Blocks(theme=gr.themes.Base()) as demo:
             )
 
             step_gr = gr.Slider(
-                label='Step',
+                label='ODE Steps',
+                info="Number of ODE integration steps. More steps = better quality but slower. Try 25-50.",
                 minimum=1,
                 maximum=100,
                 value=25,
@@ -395,6 +343,7 @@ with gr.Blocks(theme=gr.themes.Base()) as demo:
 
             solver_gr = gr.Dropdown(
                 label='ODE Solver',
+                info="Solver is only used when there is no prefix/postfix (no inpainting). RePaint always uses Euler stepping.",
                 choices=['euler', 'midpoint', 'dopri5', 'rk4', 'implicit_adams', 'bosh3', 'fehlberg2', 'adaptive_heun'],
                 value='dopri5'
             )
@@ -406,27 +355,32 @@ with gr.Blocks(theme=gr.themes.Base()) as demo:
                 value=3,
             )
 
-            # --- Blending Controls ---
-            gr.Markdown("### Blending Options")
+            # --- RePaint Controls ---
+            gr.Markdown("### RePaint Inpainting Options")
+            gr.Markdown("*Known audio is always re-injected at each ODE step. "
+                        "Enable resampling jumps for additional boundary harmonization (slower but potentially better).*")
 
-            enable_mask_feather_gr = gr.Checkbox(
-                label="Enable Mask Feathering (during generation)",
-                info="Applies a gradient ramp to the CFM decoder mask at prefix/suffix boundaries",
+            enable_repaint_jumps_gr = gr.Checkbox(
+                label="Enable Resampling Jumps",
+                info="At intervals, jump back in time and re-denoise. Forces repeated harmonization at boundaries.",
                 value=False,
             )
 
-            enable_mel_crossfade_gr = gr.Checkbox(
-                label="Enable Mel Crossfade (post-generation)",
-                info="Linearly blends original and generated mel at boundaries after generation",
-                value=False,
+            jump_length_gr = gr.Slider(
+                label='Jump Length (steps)',
+                info="How many ODE steps to advance before jumping back. Smaller = more frequent jumps.",
+                minimum=1,
+                maximum=20,
+                value=3,
+                step=1
             )
 
-            feather_frames_gr = gr.Slider(
-                label='Feather/Crossfade Width (frames)',
-                info="Number of frames for the gradient ramp (shared by both approaches)",
-                minimum=0,
-                maximum=50,
-                value=5,
+            jump_n_sample_gr = gr.Slider(
+                label='Jump Resample Count',
+                info="How many times to resample at each jump point. More = better harmonization but slower.",
+                minimum=1,
+                maximum=10,
+                value=3,
                 step=1
             )
 
@@ -441,7 +395,7 @@ with gr.Blocks(theme=gr.themes.Base()) as demo:
     tts_button.click(
         inference,
         [original_text_gr, edited_text_gr, ref_audio_gr, language_gr, step_gr, temperature_gr,
-         length_scale_gr, solver_gr, cfg_gr, enable_mask_feather_gr, enable_mel_crossfade_gr, feather_frames_gr],
+         length_scale_gr, solver_gr, cfg_gr, enable_repaint_jumps_gr, jump_length_gr, jump_n_sample_gr],
         outputs=[audio_gr, mel_gr, alignment_plot_gr, alignment_info_gr]
     )
 
