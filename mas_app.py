@@ -50,7 +50,8 @@ def transcribe(audio):
 
 @torch.inference_mode()
 def inference(original_text, edited_text, reference_audio, language, step, temperature,
-              length_scale, solver, cfg, enable_repaint_jumps, jump_length, jump_n_sample):
+              length_scale, solver, cfg, enable_repaint_jumps, jump_length, jump_n_sample,
+              save_trajectory):
     """
     Full MAS-alignment-based inpainting pipeline with RePaint-style generation:
     1. Align original text to reference audio (get word boundaries via MAS)
@@ -102,6 +103,8 @@ def inference(original_text, edited_text, reference_audio, language, step, tempe
         blend_opts['repaint_jumps'] = True
         blend_opts['jump_length'] = int(jump_length)
         blend_opts['jump_n_sample'] = int(jump_n_sample)
+    if save_trajectory:
+        blend_opts['save_trajectory'] = True
 
     # --- Step 5: Generate using the inference pipeline (now with RePaint) ---
     audio_output, mel_output = model.inference(
@@ -384,6 +387,12 @@ with gr.Blocks(theme=gr.themes.Base()) as demo:
                 step=1
             )
 
+            save_trajectory_gr = gr.Checkbox(
+                label="Save Trajectory Debug Images",
+                info="Saves mel spectrogram snapshots at each ODE step to ./trajectory_debug/ for visualization",
+                value=False,
+            )
+
         with gr.Column():
             mel_gr = gr.Plot(label="Mel Spectrogram")
             audio_gr = gr.Audio(label="Synthesised Audio", autoplay=True)
@@ -395,7 +404,8 @@ with gr.Blocks(theme=gr.themes.Base()) as demo:
     tts_button.click(
         inference,
         [original_text_gr, edited_text_gr, ref_audio_gr, language_gr, step_gr, temperature_gr,
-         length_scale_gr, solver_gr, cfg_gr, enable_repaint_jumps_gr, jump_length_gr, jump_n_sample_gr],
+         length_scale_gr, solver_gr, cfg_gr, enable_repaint_jumps_gr, jump_length_gr, jump_n_sample_gr,
+         save_trajectory_gr],
         outputs=[audio_gr, mel_gr, alignment_plot_gr, alignment_info_gr]
     )
 

@@ -103,6 +103,7 @@ class CFMDecoder(torch.nn.Module):
         repaint_jumps = blend_opts.get('repaint_jumps', False)
         jump_length = blend_opts.get('jump_length', 3)
         jump_n_sample = blend_opts.get('jump_n_sample', 3)
+        save_trajectory = blend_opts.get('save_trajectory', False)
 
         # --- Build the full concatenated sequence ---
         # Generate noise for the editable region
@@ -111,19 +112,19 @@ class CFMDecoder(torch.nn.Module):
         # Track prefix/suffix lengths for re-injection
         prefix_len = prefix.shape[-1] if prefix is not None else 0
         postfix_len = postfix.shape[-1] if postfix is not None else 0
+        edit_len = mu.shape[-1]
 
         # Build full mu (encoder conditioning) by concatenating prefix_mu + edit_mu + suffix_mu
         full_mu = self._build_full_mu(mu, prefix, postfix, p_mu, s_mu)
 
         # Build full mask (all 1's — model sees everything in RePaint)
-        full_mask = torch.ones(*mask.shape[:-1], prefix_len + mu.shape[-1] + postfix_len, device=mask.device)
+        full_mask = torch.ones(*mask.shape[:-1], prefix_len + edit_len + postfix_len, device=mask.device)
 
         # Store the original clean mel for known regions
-        # and the initial noise we'll use for re-injection
         original_prefix = prefix  # clean mel
         original_postfix = postfix  # clean mel
 
-        # Generate noise for the known regions (same noise used throughout for consistency)
+        # Generate initial noise for the known regions
         noise_prefix = torch.randn_like(prefix) * temperature if prefix is not None else None
         noise_postfix = torch.randn_like(postfix) * temperature if postfix is not None else None
 
@@ -152,8 +153,10 @@ class CFMDecoder(torch.nn.Module):
             # Simple forward schedule: 0, 1, 2, ..., n_timesteps
             step_schedule = list(range(n_timesteps + 1))
 
+        # Optional trajectory saving for debugging
+        trajectory_snapshots = [] if save_trajectory else None
+
         # Walk through the schedule
-        current_step_idx = 0
         i = 0
         while i < len(step_schedule) - 1:
             current_step = step_schedule[i]
@@ -168,33 +171,97 @@ class CFMDecoder(torch.nn.Module):
                 velocity = estimator_fn(t_current, z)
                 z = z + dt * velocity
             else:
-                # Backward step (re-noising): t_current → t_next (t decreases, i.e., add noise)
-                # In flow matching: x_t = (1-t)*x_0 + t*x_1
-                # To go from t_current to t_next (where t_next < t_current),
-                # we re-derive z at t_next from the current estimate of x_1
-                # Current best estimate of clean signal: z at t_current ≈ x_1 (approximately)
-                # But we need to add noise back. We use the flow matching interpolation:
-                # z_t_next = (1 - t_next) * noise_original + t_next * z_current_estimate
-                # where noise_original is the noise we started with
-                # This is a simplification — we re-noise using the original noise
-                z_edit_region = z[:, :, prefix_len:prefix_len + mu.shape[-1]]
-                z_edit_renoised = (1 - t_next) * z_edit[: , :, :] + t_next * z_edit_region
-                z[:, :, prefix_len:prefix_len + mu.shape[-1]] = z_edit_renoised
+                # Backward step (re-noising): jump back in time
+                # Use FRESH noise for the edit region to introduce new degrees of freedom.
+                # The known regions get fresh noise too (they'll be re-injected below).
+                #
+                # Key insight: z_edit_region is x_{t_current}, NOT x_1 (clean signal).
+                # It's a mixture: x_{t_current} ≈ (1-t_current)*noise + t_current*signal
+                # We want x_{t_next} ≈ (1-t_next)*noise + t_next*signal
+                # Interpolating between fresh noise (representing t=0) and x_{t_current}
+                # by ratio = t_next/t_current gives the correct signal fraction:
+                #   ratio * x_{t_current} = ratio * t_current * signal = t_next * signal ✓
+                fresh_noise = torch.randn(z.shape[0], z.shape[1], edit_len, device=z.device) * temperature
+                z_edit_region = z[:, :, prefix_len:prefix_len + edit_len]
+                ratio = (t_next / t_current) if t_current > 0 else 0.0
+                z[:, :, prefix_len:prefix_len + edit_len] = (1 - ratio) * fresh_noise + ratio * z_edit_region
 
             # Re-inject known regions at the current noise level
             # In flow matching: x_t = (1-t)*x_0 + t*x_1
             # where x_0 is noise, x_1 is clean signal
+            # Use fresh noise for known regions on backward jumps to avoid bias
             t_inject = t_next
             if prefix is not None:
+                if next_step < current_step:
+                    # Backward jump: use fresh noise for known region too
+                    noise_prefix = torch.randn_like(prefix) * temperature
                 known_at_t = (1 - t_inject) * noise_prefix + t_inject * original_prefix
                 z[:, :, :prefix_len] = known_at_t
             if postfix is not None:
+                if next_step < current_step:
+                    # Backward jump: use fresh noise for known region too
+                    noise_postfix = torch.randn_like(postfix) * temperature
                 known_at_t = (1 - t_inject) * noise_postfix + t_inject * original_postfix
                 z[:, :, -postfix_len:] = known_at_t
 
+            # Save trajectory snapshot if requested
+            if save_trajectory:
+                trajectory_snapshots.append({
+                    'step_idx': i,
+                    'from_step': current_step,
+                    'to_step': next_step,
+                    't': t_next.item(),
+                    'direction': 'FWD' if next_step > current_step else 'BACK',
+                    'mel': z.detach().cpu().clone(),
+                })
+
             i += 1
 
+        # Save trajectory to disk if requested
+        if save_trajectory and trajectory_snapshots:
+            self._save_trajectory(trajectory_snapshots)
+
         return z
+
+    def _save_trajectory(self, snapshots):
+        """Save trajectory snapshots as mel spectrogram images for debugging."""
+        import os
+        import numpy as np
+
+        traj_dir = './trajectory_debug'
+        os.makedirs(traj_dir, exist_ok=True)
+
+        # Clear any previous trajectory images
+        for f in os.listdir(traj_dir):
+            if f.startswith('traj_') and f.endswith('.png'):
+                os.remove(os.path.join(traj_dir, f))
+
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+
+            for idx, snap in enumerate(snapshots):
+                mel = snap['mel'].squeeze(0).numpy()
+                fig, ax = plt.subplots(figsize=(20, 4))
+                ax.imshow(mel, aspect='auto', origin='lower', cmap='viridis')
+                direction = snap['direction']
+                ax.set_title(f"Step {idx}: {snap['from_step']}->{snap['to_step']} ({direction}) t={snap['t']:.4f}")
+                fig.tight_layout()
+                filepath = os.path.join(traj_dir, f'traj_{idx:04d}_{direction}_{snap["from_step"]}to{snap["to_step"]}.png')
+                fig.savefig(filepath, dpi=72)
+                plt.close(fig)
+
+            print(f"[RePaint] Saved {len(snapshots)} trajectory snapshots to {os.path.abspath(traj_dir)}/")
+        except Exception as e:
+            # Fallback: save as numpy arrays if matplotlib fails
+            print(f"[RePaint] matplotlib failed ({e}), saving as .npy files instead")
+            for idx, snap in enumerate(snapshots):
+                mel = snap['mel'].squeeze(0).numpy()
+                direction = snap['direction']
+                filepath = os.path.join(traj_dir, f'traj_{idx:04d}_{direction}_{snap["from_step"]}to{snap["to_step"]}.npy')
+                np.save(filepath, mel)
+            print(f"[RePaint] Saved {len(snapshots)} trajectory .npy files to {os.path.abspath(traj_dir)}/")
 
     def _build_full_mu(self, mu, prefix, postfix, p_mu, s_mu):
         """Build the full encoder conditioning tensor by concatenating prefix/edit/suffix mu."""
