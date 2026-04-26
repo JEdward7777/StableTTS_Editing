@@ -243,6 +243,68 @@ def _compute_word_boundaries(durations: torch.Tensor, word_phoneme_boundaries: l
     return word_boundaries
 
 
+def text_position_to_mel_frame(
+    text: str,
+    char_position: int,
+    durations: 'torch.Tensor',
+    phonemizer,
+) -> int:
+    """Convert a character position in text to a mel frame index.
+
+    Uses piecewise G2P: runs the phonemizer on the text up to char_position,
+    counts the resulting phonemes, maps to the interspersed token index, and
+    sums MAS durations to get the exact mel frame.
+
+    The G2P pipeline (e.g., eng_to_ipa) strips trailing whitespace, so if the
+    text up to char_position ends with a space, we add it back to the phoneme
+    list to maintain correct alignment with the full-text phoneme sequence.
+
+    Args:
+        text: The full text string that was aligned with MAS.
+        char_position: Character index in ``text`` (0-based). The returned frame
+            is the boundary *before* this character — i.e., the mel frame where
+            the audio for characters [0, char_position) ends.
+        durations: Per-interspersed-token duration tensor from MAS alignment.
+            Shape: (interspersed_text_length,).
+        phonemizer: The G2P function (e.g., ``english_to_ipa2``). Must accept a
+            string and return a list of phoneme characters.
+
+    Returns:
+        Mel frame index corresponding to the boundary at ``char_position``.
+    """
+    if char_position <= 0:
+        return 0
+    if char_position >= len(text):
+        return int(durations.sum().item())
+
+    # Extract the prefix text up to the character position
+    prefix_text = text[:char_position]
+
+    # Run G2P on the stripped prefix
+    prefix_phonemes = phonemizer(prefix_text.strip())
+
+    # G2P strips trailing whitespace. If the prefix ends with a space,
+    # add it back so the phoneme count matches the full-text alignment.
+    if prefix_text.endswith(' '):
+        prefix_phonemes = list(prefix_phonemes) + [' ']
+
+    # Map phoneme count to interspersed token index.
+    # After intersperse, phoneme at index i becomes token 2*i + 1.
+    # The prefix occupies tokens 0 through 2*N (inclusive), where N = len(prefix_phonemes).
+    # Token 2*N is the blank after the last prefix phoneme.
+    n_prefix_phonemes = len(prefix_phonemes)
+    interspersed_end = 2 * n_prefix_phonemes  # exclusive: sum durations [0, interspersed_end)
+
+    # Clamp to valid range
+    interspersed_end = min(interspersed_end, len(durations))
+
+    if interspersed_end <= 0:
+        return 0
+
+    # Sum durations for the prefix tokens to get the mel frame
+    return int(durations[:interspersed_end].sum().item())
+
+
 def compute_edit_regions(original_text: str, edited_text: str, word_boundaries: list, total_mel_frames: int) -> dict:
     """
     Given original text, edited text, and word boundaries from alignment,
