@@ -14,6 +14,7 @@ Uses:
 import os
 os.environ['TMPDIR'] = './temps'  # avoid the system default temp folder not having access permissions
 
+import argparse
 import tempfile
 import numpy as np
 
@@ -32,7 +33,11 @@ try:
 except ImportError:
     WHISPER_AVAILABLE = False
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+parser = argparse.ArgumentParser(description='StableTTS Multi-Edit Inpainting')
+parser.add_argument('--cpu', action='store_true', help='Force CPU inference even if CUDA is available')
+args, _ = parser.parse_known_args()
+
+device = 'cpu' if args.cpu else ('cuda' if torch.cuda.is_available() else 'cpu')
 
 tts_model_path = './checkpoints/checkpoint_josh.pt'
 vocoder_model_path = './vocoders/pretrained/firefly-gan-base-generator.ckpt'
@@ -42,13 +47,18 @@ whisper_model_name = "tiny.en"
 model = StableTTSAPI(tts_model_path, vocoder_model_path, vocoder_type).to(device)
 
 
+_whisper_model = None  # cached on first use; never reloaded
+
+
 def transcribe(audio):
     """Transcribe audio using Whisper (optional convenience)."""
+    global _whisper_model
     if not WHISPER_AVAILABLE:
         raise gr.Error("Whisper is not installed. Please provide the transcript manually.")
+    if _whisper_model is None:
+        _whisper_model = whisper.load_model(whisper_model_name)
     whisper_audio = whisper.load_audio(audio)
-    whisper_model = whisper.load_model(whisper_model_name)
-    transcription = whisper_model.transcribe(whisper_audio, word_timestamps=True)
+    transcription = _whisper_model.transcribe(whisper_audio, word_timestamps=True)
     return transcription['text']
 
 
@@ -194,6 +204,12 @@ def inference(original_text, edited_text, reference_audio, language, step, tempe
 
         current_text = new_text
         current_audio_path = temp_audio_path
+
+        # Free GPU memory between edit iterations so the next pass doesn't OOM.
+        # inference_mode() suppresses gradient tracking but does NOT reclaim
+        # the cached allocator pool; empty_cache() does.
+        if device == 'cuda':
+            torch.cuda.empty_cache()
 
     # --- Step 3: Build output ---
     return _build_output(diff_result, intermediate_results)
