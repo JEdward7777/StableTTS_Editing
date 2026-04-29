@@ -52,6 +52,18 @@ from multi_edit_diff import compute_edit_regions, EditRegion
 
 
 # ---------------------------------------------------------------------------
+# Custom exceptions
+# ---------------------------------------------------------------------------
+
+class PunctuationOnlyEdits(Exception):
+    """Raised when all detected edits are punctuation/whitespace-only.
+
+    The caller should treat this the same as 'no edits' and copy the source
+    audio through unchanged rather than skipping the verse entirely.
+    """
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -141,7 +153,7 @@ def run_inpainting(
     alpha_edits = [e for e in diff_result.edits if _edit_changes_alpha(e)]
 
     if len(alpha_edits) == 0:
-        raise ValueError(
+        raise PunctuationOnlyEdits(
             "All detected edits are punctuation/whitespace-only — nothing to inpaint."
         )
 
@@ -260,6 +272,12 @@ def parse_args():
     parser.add_argument(
         '--out_csv', required=True,
         help='Output CSV path. Audio files are saved in an "audio" folder next to it.'
+    )
+    parser.add_argument(
+        '--out_format', default='wav', choices=['wav', 'mp3', 'flac', 'ogg'],
+        help='Output audio format (default: wav). '
+             'The inpainting pipeline always produces WAV internally; '
+             'this controls the final saved format.'
     )
     parser.add_argument(
         '--force', action='store_true',
@@ -385,7 +403,7 @@ def main():
         # Determine output audio filename
         # Use a filesystem-safe version of the verse_id as the filename
         safe_id = re.sub(r'[^\w\-.]', '_', verse_id)
-        out_audio_filename = f"{safe_id}.wav"
+        out_audio_filename = f"{safe_id}.{args.out_format}"
         out_audio_path = os.path.join(audio_out_dir, out_audio_filename)
         # Relative path from out_csv directory
         out_audio_rel = os.path.join('audio', out_audio_filename)
@@ -415,10 +433,14 @@ def main():
 
         # Check if texts are identical
         if original_text.strip() == edited_text.strip():
-            print(f"  [skip] Original and target text are identical — copying source audio.")
-            # Just copy the source audio
-            import shutil
-            shutil.copy2(src_audio_path, out_audio_path)
+            print(f"  [skip] Original and target text are identical — transcoding source audio.")
+            # Decode the source (any format) and re-save in the requested output format
+            try:
+                src_waveform, src_sr = torchaudio.load(src_audio_path)
+                torchaudio.save(out_audio_path, src_waveform, src_sr)
+            except Exception as exc:
+                print(f"  [error] Could not transcode source audio: {exc} — skipping.")
+                continue
             out_by_id[verse_id] = {
                 'verse_id': verse_id,
                 'transcription': edited_text,
@@ -442,6 +464,21 @@ def main():
                 min_match=args.min_match,
                 device=device,
             )
+        except PunctuationOnlyEdits as exc:
+            print(f"  [info] {exc}")
+            print(f"  [info] Transcoding source audio unchanged (punctuation-only diff).")
+            try:
+                src_waveform, src_sr = torchaudio.load(src_audio_path)
+                torchaudio.save(out_audio_path, src_waveform, src_sr)
+            except Exception as copy_exc:
+                print(f"  [error] Could not transcode source audio: {copy_exc} — skipping.")
+                continue
+            out_by_id[verse_id] = {
+                'verse_id': verse_id,
+                'transcription': edited_text,
+                'file_name': out_audio_rel,
+            }
+            continue
         except ValueError as exc:
             print(f"  [error] {exc} — skipping.")
             continue
