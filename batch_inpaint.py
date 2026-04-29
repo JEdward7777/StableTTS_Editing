@@ -27,9 +27,9 @@ Usage:
 
 CSV schemas
 -----------
-from_csv  : input_id, transcription, file_name
-to_csv    : input_id, transcription
-out_csv   : input_id, transcription, file_name   (written by this script)
+from_csv  : verse_id, transcription, file_name
+to_csv    : verse_id, transcription
+out_csv   : verse_id, transcription, file_name   (written by this script)
 """
 
 import os
@@ -251,11 +251,11 @@ def parse_args():
     )
     parser.add_argument(
         '--from_csv', required=True,
-        help='Input CSV with columns: input_id, transcription, file_name'
+        help='Input CSV with columns: verse_id, transcription, file_name'
     )
     parser.add_argument(
         '--to_csv', required=True,
-        help='Target CSV with columns: input_id, transcription'
+        help='Target CSV with columns: verse_id, transcription'
     )
     parser.add_argument(
         '--out_csv', required=True,
@@ -311,8 +311,8 @@ def main():
     to_rows = _load_csv(args.to_csv)
 
     # Validate required columns
-    required_from = {'input_id', 'transcription', 'file_name'}
-    required_to = {'input_id', 'transcription'}
+    required_from = {'verse_id', 'transcription', 'file_name'}
+    required_to = {'verse_id', 'transcription'}
     if from_rows:
         missing_from = required_from - set(from_rows[0].keys())
         if missing_from:
@@ -322,9 +322,9 @@ def main():
         if missing_to:
             sys.exit(f"ERROR: to_csv is missing columns: {missing_to}")
 
-    # Build lookup dicts keyed by input_id
-    from_by_id: dict[str, dict] = {r['input_id']: r for r in from_rows}
-    to_by_id:   dict[str, dict] = {r['input_id']: r for r in to_rows}
+    # Build lookup dicts keyed by verse_id
+    from_by_id: dict[str, dict] = {r['verse_id']: r for r in from_rows}
+    to_by_id:   dict[str, dict] = {r['verse_id']: r for r in to_rows}
 
     # Warn about mismatches
     from_ids = set(from_by_id.keys())
@@ -359,7 +359,7 @@ def main():
     if out_csv_exists and args.target_verse is not None:
         # When targeting a single verse, load existing rows so we don't lose others
         existing_out_rows = _load_csv(args.out_csv)
-        out_by_id: dict[str, dict] = {r['input_id']: r for r in existing_out_rows}
+        out_by_id: dict[str, dict] = {r['verse_id']: r for r in existing_out_rows}
     else:
         out_by_id = {}
 
@@ -401,7 +401,7 @@ def main():
             print(f"  [skip] Output already exists. Use --force to regenerate.")
             # Still record in output CSV
             out_by_id[verse_id] = {
-                'input_id': verse_id,
+                'verse_id': verse_id,
                 'transcription': edited_text,
                 'file_name': out_audio_rel,
             }
@@ -420,7 +420,7 @@ def main():
             import shutil
             shutil.copy2(src_audio_path, out_audio_path)
             out_by_id[verse_id] = {
-                'input_id': verse_id,
+                'verse_id': verse_id,
                 'transcription': edited_text,
                 'file_name': out_audio_rel,
             }
@@ -456,7 +456,7 @@ def main():
         print(f"  [done] Saved to {out_audio_path}")
 
         out_by_id[verse_id] = {
-            'input_id': verse_id,
+            'verse_id': verse_id,
             'transcription': edited_text,
             'file_name': out_audio_rel,
         }
@@ -470,7 +470,7 @@ def main():
         # Merge: start from all to_csv rows, overlay with what we have in out_by_id
         out_rows = []
         for row in to_rows:
-            vid = row['input_id']
+            vid = row['verse_id']
             if vid in out_by_id:
                 out_rows.append(out_by_id[vid])
             else:
@@ -478,7 +478,7 @@ def main():
                 # (already loaded into out_by_id above)
                 pass  # not in out_by_id means it was never processed
         # Also include any rows that were in the old out_csv but not in to_csv
-        to_ids_set = {r['input_id'] for r in to_rows}
+        to_ids_set = {r['verse_id'] for r in to_rows}
         for vid, row in out_by_id.items():
             if vid not in to_ids_set:
                 out_rows.append(row)
@@ -486,11 +486,11 @@ def main():
         # Full run: write all processed verses in to_csv order
         out_rows = []
         for row in to_rows:
-            vid = row['input_id']
+            vid = row['verse_id']
             if vid in out_by_id:
                 out_rows.append(out_by_id[vid])
 
-    _save_csv(args.out_csv, out_rows, fieldnames=['input_id', 'transcription', 'file_name'])
+    _save_csv(args.out_csv, out_rows, fieldnames=['verse_id', 'transcription', 'file_name'])
     print(f"\nOutput CSV written: {args.out_csv} ({len(out_rows)} rows)")
 
 
