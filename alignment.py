@@ -220,7 +220,7 @@ def _compute_word_boundaries(durations: torch.Tensor, word_phoneme_boundaries: l
             token_end = len(durations)  # include trailing blank
 
         # Clamp to valid range
-        token_start = max(0, token_start)
+        token_start = max(0, min(token_start, len(durations)))
         token_end = min(len(durations), token_end)
 
         # Compute frame boundaries
