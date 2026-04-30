@@ -12,10 +12,8 @@ Uses:
 """
 
 import os
-os.environ['TMPDIR'] = './temps'  # avoid the system default temp folder not having access permissions
 
 import argparse
-import tempfile
 import numpy as np
 
 import torch
@@ -113,6 +111,7 @@ def inference(original_text, edited_text, reference_audio, language, step, tempe
     # --- Step 2: Iterative inpainting ---
     current_text = original_text.strip()
     current_audio_path = reference_audio
+    current_mel = None  # populated after first inference; avoids temp-file round-trips
     intermediate_results = []
 
     for edit_idx, edit in enumerate(diff_result.edits):
@@ -120,7 +119,12 @@ def inference(original_text, edited_text, reference_audio, language, step, tempe
         total_steps = len(diff_result.edits)
 
         # --- 2a: Align current text to current audio ---
-        alignment = align_text_to_audio(model, current_text, current_audio_path, language)
+        # Pass the mel tensor directly after the first iteration so no temp
+        # file needs to be written or read back from disk.
+        alignment = align_text_to_audio(
+            model, current_text, current_audio_path, language,
+            mel_tensor=current_mel,
+        )
         durations = alignment['durations']
         mel = alignment['mel']
         total_mel_frames = mel.size(-1)
@@ -178,16 +182,12 @@ def inference(original_text, edited_text, reference_audio, language, step, tempe
                     + edit.new_text
                     + current_text[edit.original_end:])
 
-        # Save audio to temp file for next iteration's alignment
-        os.makedirs('./temps', exist_ok=True)
-        temp_audio_path = tempfile.mktemp(suffix='.wav', dir='./temps')
-        # Ensure audio is 2D (channels, samples) for torchaudio.save
-        audio_to_save = audio_output.cpu()
-        if audio_to_save.dim() == 3:
-            audio_to_save = audio_to_save.squeeze(0)  # (1, 1, samples) -> (1, samples)
-        if audio_to_save.dim() == 1:
-            audio_to_save = audio_to_save.unsqueeze(0)  # (samples,) -> (1, samples)
-        torchaudio.save(temp_audio_path, audio_to_save, model.mel_config.sample_rate)
+        # Keep the mel from this inference step so the next iteration can
+        # call align_text_to_audio() without writing/reading a temp file.
+        current_mel = mel_output.cpu()
+        # current_audio_path is only used on the very first iteration (before
+        # current_mel is populated), so we leave it pointing at the original
+        # reference audio — it won't be used again.
 
         # Collect intermediate result
         # Scale float [-1.0, 1.0] audio to signed 16-bit integer range for Gradio
@@ -205,7 +205,6 @@ def inference(original_text, edited_text, reference_audio, language, step, tempe
         })
 
         current_text = new_text
-        current_audio_path = temp_audio_path
 
         # Free GPU memory between edit iterations so the next pass doesn't OOM.
         # inference_mode() suppresses gradient tracking but does NOT reclaim

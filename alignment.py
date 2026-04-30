@@ -18,7 +18,13 @@ from utils.audio import load_and_resample_audio
 from utils.mask import sequence_mask
 
 
-def align_text_to_audio(api, text: str, audio_path: str, language: str = 'english') -> dict:
+def align_text_to_audio(
+    api,
+    text: str,
+    audio_path: str | None,
+    language: str = 'english',
+    mel_tensor: 'torch.Tensor | None' = None,
+) -> dict:
     """
     Use the trained StableTTS model's encoder + MAS to align text to audio.
 
@@ -30,8 +36,13 @@ def align_text_to_audio(api, text: str, audio_path: str, language: str = 'englis
         api: A StableTTSAPI instance (provides tts_model, mel_extractor,
              mel_config, g2p_mapping — avoids duplicating the model in memory)
         text: The transcript text corresponding to the audio
-        audio_path: Path to the audio file
+        audio_path: Path to the audio file.  May be None when *mel_tensor* is
+            provided.
         language: Language for G2P conversion (default: 'english')
+        mel_tensor: Optional pre-computed mel spectrogram tensor of shape
+            (1, n_mels, mel_length).  When supplied, *audio_path* is ignored
+            and no file I/O is performed.  This is the preferred path when the
+            caller already has the mel from a previous inference step.
 
     Returns:
         dict with:
@@ -60,9 +71,15 @@ def align_text_to_audio(api, text: str, audio_path: str, language: str = 'englis
     x = torch.tensor(token_ids, dtype=torch.long, device=device).unsqueeze(0)
     x_lengths = torch.tensor([x.size(-1)], dtype=torch.long, device=device)
 
-    # --- Load audio → mel spectrogram ---
-    audio = load_and_resample_audio(audio_path, mel_config.sample_rate).to(device)
-    mel = api.mel_extractor(audio)  # (1, n_mels, mel_length)
+    # --- Load audio → mel spectrogram (or use pre-computed tensor) ---
+    if mel_tensor is not None:
+        # Fast path: caller already has the mel — no file I/O needed.
+        mel = mel_tensor.to(device)
+        if mel.dim() == 2:
+            mel = mel.unsqueeze(0)  # ensure (1, n_mels, mel_length)
+    else:
+        audio = load_and_resample_audio(audio_path, mel_config.sample_rate).to(device)
+        mel = api.mel_extractor(audio)  # (1, n_mels, mel_length)
     y = mel
     y_lengths = torch.tensor([y.size(-1)], dtype=torch.long, device=device)
 

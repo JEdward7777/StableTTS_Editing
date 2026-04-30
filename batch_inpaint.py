@@ -37,13 +37,11 @@ out_csv   : verse_id, transcription, file_name   (written by this script)
 """
 
 import os
-os.environ['TMPDIR'] = './temps'  # keep temp files local
 
 import re
 import sys
 import csv
 import argparse
-import tempfile
 import warnings
 
 import numpy as np
@@ -179,6 +177,7 @@ def run_inpainting(
 
     current_text = original_text.strip()
     current_audio_path = reference_audio_path
+    current_mel: torch.Tensor | None = None  # set after first inference step
     audio_output: torch.Tensor = torch.zeros(1)  # initialised; always overwritten in loop
 
     for edit_idx, edit in enumerate(diff_result.edits):
@@ -186,8 +185,13 @@ def run_inpainting(
         total_steps = len(diff_result.edits)
         print(f"    [edit {step_num}/{total_steps}] {edit!r}")
 
-        # Align current text to current audio
-        alignment = align_text_to_audio(model, current_text, current_audio_path, language)
+        # Align current text to current audio.
+        # After the first iteration we pass the mel tensor directly so no
+        # temp file needs to be written or read back from disk.
+        alignment = align_text_to_audio(
+            model, current_text, current_audio_path, language,
+            mel_tensor=current_mel,
+        )
         durations = alignment['durations']
         mel = alignment['mel']
         total_mel_frames = mel.size(-1)
@@ -237,17 +241,12 @@ def run_inpainting(
             + current_text[edit.original_end:]
         )
 
-        # Save intermediate audio for next iteration's alignment
-        os.makedirs('./temps', exist_ok=True)
-        temp_audio_path = tempfile.mktemp(suffix='.wav', dir='./temps')
-        audio_to_save = audio_output.cpu()
-        if audio_to_save.dim() == 3:
-            audio_to_save = audio_to_save.squeeze(0)
-        if audio_to_save.dim() == 1:
-            audio_to_save = audio_to_save.unsqueeze(0)
-        torchaudio.save(temp_audio_path, audio_to_save, model.mel_config.sample_rate)
-
-        current_audio_path = temp_audio_path
+        # Keep the mel from this inference step so the next iteration can
+        # call align_text_to_audio() without writing/reading a temp file.
+        current_mel = _mel_output.cpu()
+        # current_audio_path is only used on the very first iteration (before
+        # current_mel is populated), so we leave it pointing at the original
+        # reference audio — it won't be used again.
 
         if device == 'cuda':
             torch.cuda.empty_cache()
