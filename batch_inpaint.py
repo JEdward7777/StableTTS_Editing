@@ -133,11 +133,14 @@ def run_inpainting(
     min_match: int,
     device: str,
     blend_opts: dict | None = None,
-) -> tuple[torch.Tensor, int]:
+) -> tuple[torch.Tensor, int, list[str]]:
     """Run the multi-edit inpainting pipeline for a single verse.
 
     Returns:
-        (audio_tensor, sample_rate) where audio_tensor is shape (1, samples).
+        (audio_tensor, sample_rate, log_lines) where audio_tensor is shape
+        (1, samples) and log_lines is a list of informational strings that
+        would otherwise have been printed directly.  The caller is responsible
+        for printing them (after any header it wants to emit first).
 
     Raises:
         PunctuationOnlyEdits: if no alphabetically-significant edits are found
@@ -145,6 +148,7 @@ def run_inpainting(
             The caller should copy the source audio through unchanged.
         ValueError: if the language is unsupported or another logic error occurs.
     """
+    log_lines: list[str] = []
     # --- Compute edit regions ---
     diff_result = compute_edit_regions(
         original_text.strip(),
@@ -165,7 +169,7 @@ def run_inpainting(
 
     skipped = len(diff_result.edits) - len(alpha_edits)
     if skipped > 0:
-        print(f"    [info] Skipping {skipped} punctuation-only edit(s).")
+        log_lines.append(f"    [info] Skipping {skipped} punctuation-only edit(s).")
 
     # Replace the edit list with the filtered one (still in right-to-left order)
     diff_result.edits[:] = alpha_edits
@@ -183,7 +187,7 @@ def run_inpainting(
     for edit_idx, edit in enumerate(diff_result.edits):
         step_num = edit_idx + 1
         total_steps = len(diff_result.edits)
-        print(f"    [edit {step_num}/{total_steps}] {edit!r}")
+        log_lines.append(f"    [edit {step_num}/{total_steps}] {edit!r}")
 
         # Align current text to current audio.
         # After the first iteration we pass the mel tensor directly so no
@@ -258,7 +262,7 @@ def run_inpainting(
     if final_audio.dim() == 1:
         final_audio = final_audio.unsqueeze(0)
 
-    return final_audio, model.mel_config.sample_rate
+    return final_audio, model.mel_config.sample_rate, log_lines
 
 
 # ---------------------------------------------------------------------------
@@ -427,17 +431,28 @@ def main():
         # Relative path from out_csv directory
         out_audio_rel = os.path.join('audio', out_audio_filename)
 
-        def _verse_header():
+        def _verse_header(lines: list[str] | None = None):
+            """Print the verse header followed by any buffered log lines.
+
+            Parameters
+            ----------
+            lines:
+                Optional list of strings to print immediately after the header
+                (e.g. the log_lines returned by run_inpainting()).  Pass an
+                empty list or omit when there are no buffered lines to emit.
+            """
             print(f"\n{'='*60}")
             print(f"Verse: {verse_id}")
             print(f"  Original : {original_text!r}")
             print(f"  Target   : {edited_text!r}")
             print(f"  Out audio: {out_audio_path}")
+            for line in (lines or []):
+                print(line)
 
         # Skip if output already exists and not forcing
         if os.path.isfile(out_audio_path) and not force:
             if not args.only_inpainted:
-                _verse_header()
+                _verse_header([])
                 print(f"  [skip] Output already exists. Use --force to regenerate.")
             # Still record in output CSV
             out_by_id[verse_id] = {
@@ -450,14 +465,14 @@ def main():
         # Resolve source audio path relative to from_csv
         src_audio_path = _resolve_audio_path(from_row['file_name'], args.from_csv)
         if not os.path.isfile(src_audio_path):
-            _verse_header()
+            _verse_header([])
             print(f"  [error] Source audio not found: {src_audio_path} — skipping.")
             continue
 
         # Check if texts are identical
         if original_text.strip() == edited_text.strip():
             if not args.only_inpainted:
-                _verse_header()
+                _verse_header([])
                 print(f"  [skip] Original and target text are identical — transcoding source audio.")
             # Decode the source (any format) and re-save in the requested output format
             try:
@@ -465,7 +480,7 @@ def main():
                 torchaudio.save(out_audio_path, src_waveform, src_sr)
             except Exception as exc:
                 if args.only_inpainted:
-                    _verse_header()
+                    _verse_header([])
                 print(f"  [error] Could not transcode source audio: {exc} — skipping.")
                 continue
             out_by_id[verse_id] = {
@@ -482,10 +497,10 @@ def main():
             'jump_n_sample': args.jump_n_sample,
         }
 
-        # Run inpainting (header is printed only if inpainting actually succeeds,
-        # so that --only_inpainted suppresses passthrough verses)
+        # Run inpainting.  run_inpainting() no longer prints directly; it
+        # returns log_lines so the header can be emitted first.
         try:
-            final_audio, sample_rate = run_inpainting(
+            final_audio, sample_rate, log_lines = run_inpainting(
                 model=model,
                 original_text=original_text,
                 edited_text=edited_text,
@@ -502,14 +517,14 @@ def main():
             )
         except PunctuationOnlyEdits as exc:
             if not args.only_inpainted:
-                _verse_header()
+                _verse_header([])
                 print(f"  [info] {exc}")
                 print(f"  [info] Transcoding source audio unchanged (punctuation-only diff).")
             try:
                 src_waveform, src_sr = torchaudio.load(src_audio_path)
                 torchaudio.save(out_audio_path, src_waveform, src_sr)
             except Exception as copy_exc:
-                _verse_header()
+                _verse_header([])
                 print(f"  [error] Could not transcode source audio: {copy_exc} — skipping.")
                 continue
             out_by_id[verse_id] = {
@@ -519,18 +534,19 @@ def main():
             }
             continue
         except ValueError as exc:
-            _verse_header()
+            _verse_header([])
             print(f"  [error] {exc} — skipping.")
             continue
         except Exception as exc:
-            _verse_header()
+            _verse_header([])
             print(f"  [error] Unexpected error: {exc} — skipping.")
             import traceback
             traceback.print_exc()
             continue
 
-        # Inpainting succeeded — always show the header and result
-        _verse_header()
+        # Inpainting succeeded — print header with buffered log lines inline,
+        # then the final result line.
+        _verse_header(log_lines)
         # Save audio
         torchaudio.save(out_audio_path, final_audio, sample_rate)
         print(f"  [done] Saved to {out_audio_path}")
