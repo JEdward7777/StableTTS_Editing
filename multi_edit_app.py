@@ -35,11 +35,13 @@ except ImportError:
 
 parser = argparse.ArgumentParser(description='StableTTS Multi-Edit Inpainting')
 parser.add_argument('--cpu', action='store_true', help='Force CPU inference even if CUDA is available')
+parser.add_argument('--tts_model', type=str, default='./checkpoints/checkpoint_josh.pt',
+                    help='Path to the TTS model checkpoint to use for inference')
 args, _ = parser.parse_known_args()
 
 device = 'cpu' if args.cpu else ('cuda' if torch.cuda.is_available() else 'cpu')
 
-tts_model_path = './checkpoints/checkpoint_josh.pt'
+tts_model_path = args.tts_model
 vocoder_model_path = './vocoders/pretrained/firefly-gan-base-generator.ckpt'
 vocoder_type = 'ffgan'
 whisper_model_name = "tiny.en"
