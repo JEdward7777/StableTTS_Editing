@@ -109,7 +109,8 @@ class StableTTS(nn.Module):
         #do the suffix first so that the mu_y indexes are correct for the prefix.
         if suffix_text is not None:
             #now need to figure out where the suffix text starts so that we can trim it off.
-            p_t_length = prefix_text.size(-1) + x_orig.size(-1)
+            prefix_text_len = prefix_text.size(-1) if prefix_text is not None else 0
+            p_t_length = prefix_text_len + x_orig.size(-1)
 
             #now figure out where in the y dimension that is.
             attn_sliced = attn[0, 0, p_t_length, : ]
