@@ -16,6 +16,7 @@ Usage:
         --out_csv  path/to/output.csv \\
         [--force] \\
         [--target_verse "MAT 1:1"] \\
+        [--only_inpainted] \\
         [--language english] \\
         [--step 25] \\
         [--temperature 1.0] \\
@@ -23,6 +24,9 @@ Usage:
         [--solver dopri5] \\
         [--cfg 3.0] \\
         [--min_match 2] \\
+        [--repaint_jumps] \\
+        [--jump_length 3] \\
+        [--jump_n_sample 3] \\
         [--cpu]
 
 CSV schemas
@@ -130,6 +134,7 @@ def run_inpainting(
     cfg: float,
     min_match: int,
     device: str,
+    blend_opts: dict | None = None,
 ) -> tuple[torch.Tensor, int]:
     """Run the multi-edit inpainting pipeline for a single verse.
 
@@ -137,7 +142,10 @@ def run_inpainting(
         (audio_tensor, sample_rate) where audio_tensor is shape (1, samples).
 
     Raises:
-        ValueError: if no edits are found or the language is unsupported.
+        PunctuationOnlyEdits: if no alphabetically-significant edits are found
+            (either no edits at all, or all edits are punctuation/whitespace-only).
+            The caller should copy the source audio through unchanged.
+        ValueError: if the language is unsupported or another logic error occurs.
     """
     # --- Compute edit regions ---
     diff_result = compute_edit_regions(
@@ -147,7 +155,7 @@ def run_inpainting(
     )
 
     if len(diff_result.edits) == 0:
-        raise ValueError("No edits detected between original and target text.")
+        raise PunctuationOnlyEdits("No edits detected between original and target text.")
 
     # Filter out edits that don't change any alphabetic characters
     alpha_edits = [e for e in diff_result.edits if _edit_changes_alpha(e)]
@@ -214,6 +222,7 @@ def run_inpainting(
             postfix=suffix_mel,
             prefix_text=prefix_text if prefix_text else None,
             suffix_text=suffix_text if suffix_text else None,
+            blend_opts=blend_opts,
         )
 
         # Normalise
@@ -301,8 +310,19 @@ def parse_args():
                         help='Classifier-free guidance scale (default: 3.0)')
     parser.add_argument('--min_match', type=int, default=2,
                         help='JLDiff coalescence threshold (default: 2)')
+    # RePaint resampling-jump options (passed through as blend_opts)
+    parser.add_argument('--repaint_jumps', action='store_true',
+                        help='Enable RePaint-style resampling jumps for better boundary coherence.')
+    parser.add_argument('--jump_length', type=int, default=3,
+                        help='Number of forward steps before each resampling jump (default: 3).')
+    parser.add_argument('--jump_n_sample', type=int, default=3,
+                        help='Total traversals per segment including first pass (default: 3).')
     parser.add_argument('--cpu', action='store_true',
                         help='Force CPU inference even if CUDA is available')
+    parser.add_argument('--only_inpainted', action='store_true',
+                        help='Only print output for verses that actually undergo inpainting '
+                             '(suppress headers for identical-text, punctuation-only, and '
+                             'already-skipped verses).')
     # Model paths
     parser.add_argument('--tts_model', required=True,
                         help='Path to TTS model checkpoint (required)')
@@ -408,15 +428,18 @@ def main():
         # Relative path from out_csv directory
         out_audio_rel = os.path.join('audio', out_audio_filename)
 
-        print(f"\n{'='*60}")
-        print(f"Verse: {verse_id}")
-        print(f"  Original : {original_text!r}")
-        print(f"  Target   : {edited_text!r}")
-        print(f"  Out audio: {out_audio_path}")
+        def _verse_header():
+            print(f"\n{'='*60}")
+            print(f"Verse: {verse_id}")
+            print(f"  Original : {original_text!r}")
+            print(f"  Target   : {edited_text!r}")
+            print(f"  Out audio: {out_audio_path}")
 
         # Skip if output already exists and not forcing
         if os.path.isfile(out_audio_path) and not force:
-            print(f"  [skip] Output already exists. Use --force to regenerate.")
+            if not args.only_inpainted:
+                _verse_header()
+                print(f"  [skip] Output already exists. Use --force to regenerate.")
             # Still record in output CSV
             out_by_id[verse_id] = {
                 'verse_id': verse_id,
@@ -428,17 +451,22 @@ def main():
         # Resolve source audio path relative to from_csv
         src_audio_path = _resolve_audio_path(from_row['file_name'], args.from_csv)
         if not os.path.isfile(src_audio_path):
+            _verse_header()
             print(f"  [error] Source audio not found: {src_audio_path} — skipping.")
             continue
 
         # Check if texts are identical
         if original_text.strip() == edited_text.strip():
-            print(f"  [skip] Original and target text are identical — transcoding source audio.")
+            if not args.only_inpainted:
+                _verse_header()
+                print(f"  [skip] Original and target text are identical — transcoding source audio.")
             # Decode the source (any format) and re-save in the requested output format
             try:
                 src_waveform, src_sr = torchaudio.load(src_audio_path)
                 torchaudio.save(out_audio_path, src_waveform, src_sr)
             except Exception as exc:
+                if args.only_inpainted:
+                    _verse_header()
                 print(f"  [error] Could not transcode source audio: {exc} — skipping.")
                 continue
             out_by_id[verse_id] = {
@@ -448,7 +476,15 @@ def main():
             }
             continue
 
-        # Run inpainting
+        # Build blend_opts from repaint args
+        blend_opts = {
+            'repaint_jumps': args.repaint_jumps,
+            'jump_length': args.jump_length,
+            'jump_n_sample': args.jump_n_sample,
+        }
+
+        # Run inpainting (header is printed only if inpainting actually succeeds,
+        # so that --only_inpainted suppresses passthrough verses)
         try:
             final_audio, sample_rate = run_inpainting(
                 model=model,
@@ -463,14 +499,18 @@ def main():
                 cfg=args.cfg,
                 min_match=args.min_match,
                 device=device,
+                blend_opts=blend_opts,
             )
         except PunctuationOnlyEdits as exc:
-            print(f"  [info] {exc}")
-            print(f"  [info] Transcoding source audio unchanged (punctuation-only diff).")
+            if not args.only_inpainted:
+                _verse_header()
+                print(f"  [info] {exc}")
+                print(f"  [info] Transcoding source audio unchanged (punctuation-only diff).")
             try:
                 src_waveform, src_sr = torchaudio.load(src_audio_path)
                 torchaudio.save(out_audio_path, src_waveform, src_sr)
             except Exception as copy_exc:
+                _verse_header()
                 print(f"  [error] Could not transcode source audio: {copy_exc} — skipping.")
                 continue
             out_by_id[verse_id] = {
@@ -480,14 +520,18 @@ def main():
             }
             continue
         except ValueError as exc:
+            _verse_header()
             print(f"  [error] {exc} — skipping.")
             continue
         except Exception as exc:
+            _verse_header()
             print(f"  [error] Unexpected error: {exc} — skipping.")
             import traceback
             traceback.print_exc()
             continue
 
+        # Inpainting succeeded — always show the header and result
+        _verse_header()
         # Save audio
         torchaudio.save(out_audio_path, final_audio, sample_rate)
         print(f"  [done] Saved to {out_audio_path}")
