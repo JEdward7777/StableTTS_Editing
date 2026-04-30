@@ -132,8 +132,8 @@ class StableTTS(nn.Module):
 
         if prefix_text is not None:
             #what is the length of the prefix_text.
-            #go one past the length of the prefix text.
-            p_length = prefix_text.size(-1) + 1
+            #the first token of the main text is at index prefix_text.size(-1) (0-indexed).
+            p_length = prefix_text.size(-1)
 
             #now figure out where in the y dimension that is.
             attn_sliced = attn[0, 0, p_length, : ]
