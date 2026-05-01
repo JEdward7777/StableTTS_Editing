@@ -52,12 +52,54 @@ def parse_verse_id(verse_id: str):
         return None, None, None, None
 
 
+# ---------------------------------------------------------------------------
+# Canonical Bible book order (66-book Protestant canon, USFM 3-letter codes)
+# Books not found in this list are sorted alphabetically after all known books.
+# Source: standard USFM book identifiers in canonical order.
+# ---------------------------------------------------------------------------
+
+CANON_ORDER: list = [
+    # Old Testament
+    "GEN", "EXO", "LEV", "NUM", "DEU",
+    "JOS", "JDG", "RUT",
+    "1SA", "2SA", "1KI", "2KI",
+    "1CH", "2CH",
+    "EZR", "NEH", "EST",
+    "JOB", "PSA", "PRO", "ECC", "SNG",
+    "ISA", "JER", "LAM", "EZK", "DAN",
+    "HOS", "JOL", "AMO", "OBA", "JON", "MIC",
+    "NAM", "HAB", "ZEP", "HAG", "ZEC", "MAL",
+    # New Testament
+    "MAT", "MRK", "LUK", "JHN",
+    "ACT",
+    "ROM", "1CO", "2CO", "GAL", "EPH", "PHP", "COL",
+    "1TH", "2TH", "1TI", "2TI", "TIT", "PHM",
+    "HEB", "JAS", "1PE", "2PE",
+    "1JN", "2JN", "3JN", "JUD",
+    "REV",
+]
+
+_CANON_INDEX: dict = {book: i for i, book in enumerate(CANON_ORDER)}
+
+
+def book_canon_index(book: str):
+    """
+    Return a sort key for *book* that places known books in canonical order
+    and unknown books alphabetically after all known books.
+    """
+    idx = _CANON_INDEX.get(book)
+    if idx is not None:
+        return (0, idx, "")
+    # Unknown book: sort after all canonical books, then alphabetically
+    return (1, 0, book)
+
+
 def sort_key(verse_id: str):
     """Return a sortable tuple for a verse_id."""
     book, chapter, verse_start, verse_end = parse_verse_id(verse_id)
     if book is None:
-        return ('', 0, 0, 0)
-    return (book, chapter, verse_start, verse_end)
+        return ((1, 0, ""), 0, 0, 0)
+    return (book_canon_index(book), chapter, verse_start, verse_end)
 
 
 # ---------------------------------------------------------------------------
@@ -109,14 +151,8 @@ def build_chapter_index(from_df: pd.DataFrame, to_df: pd.DataFrame):
         if b2 is not None:
             chapters.add((b2, c2))
 
-    # Sort chapters preserving book order from from_df first, then to_df
-    book_order: dict = {}
-    for df in [from_df, to_df]:
-        for book in df['book'].dropna():
-            if book not in book_order:
-                book_order[book] = len(book_order)
-
-    sorted_chapters = sorted(chapters, key=lambda bc: (book_order.get(bc[0], 9999), bc[1]))
+    # Sort chapters in canonical Bible order
+    sorted_chapters = sorted(chapters, key=lambda bc: (book_canon_index(bc[0]), bc[1]))
 
     return sorted_chapters, from_lookup, to_lookup
 
