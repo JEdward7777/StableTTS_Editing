@@ -76,6 +76,35 @@ Key features:
 - Supports multiple output formats (`wav`, `mp3`, `flac`, `ogg`).
 - Exposes all RePaint parameters as CLI flags.
 
+#### CSV schemas
+
+| CSV | Required columns | Notes |
+|-----|-----------------|-------|
+| `from_csv` | `verse_id`, `transcription`, `file_name` | `file_name` is the path to the source audio, relative to the CSV file's directory |
+| `to_csv` | `verse_id`, `transcription` | Target transcriptions; rows are matched to `from_csv` by `verse_id` |
+| `out_csv` | `verse_id`, `transcription`, `file_name` | Written by the script; audio files are saved in an `audio/` sub-folder next to the CSV |
+
+#### `verse_id` format
+
+`batch_inpaint.py` treats `verse_id` as an **opaque unique string**.  Any value is acceptable as long as it is unique within each CSV and consistent between `from_csv` and `to_csv` so that rows can be matched.  The value is also used (after sanitising non-word characters to `_`) as the stem of the output audio filename.
+
+The intended use case is scripture audio, where `verse_id` follows the **USFM 3-letter book-code** convention:
+
+```
+BOOK CHAPTER:VERSE          e.g.  MAT 1:1
+BOOK CHAPTER:VERSE_START-VERSE_END   e.g.  1CO 3:10-11
+```
+
+This format is **required by `demo_inpainting.py`**, which parses it to power its book/chapter navigation UI and to sort verses in canonical 66-book Protestant Bible order.
+
+#### Note on scripture coupling
+
+The column name `verse_id` and the USFM reference format are the primary scripture-specific aspects of this pipeline.  `batch_inpaint.py` itself is fully generic — it does not parse the `verse_id` value in any way.  To adapt the batch pipeline for non-scripture audio (e.g. audiobook chapters, podcast segments):
+
+- `verse_id` can contain any unique identifier (e.g. `"chapter_03_segment_07"`).
+- `batch_inpaint.py` will work without modification.
+- `demo_inpainting.py` assumes USFM-parseable IDs for its navigation; using it with non-scripture IDs would require rewriting the [`parse_verse_id()`](demo_inpainting.py:28) function and the [`CANON_ORDER`](demo_inpainting.py:61) sort logic.
+
 ### Comparison demo — `demo_inpainting.py`
 
 [`demo_inpainting.py`](demo_inpainting.py) is a read-only Gradio viewer for comparing source and inpainted audio side-by-side, navigating by book/chapter/verse.  It is designed to be used after `batch_inpaint.py` has produced an output CSV.
