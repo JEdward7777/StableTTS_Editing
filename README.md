@@ -166,6 +166,10 @@ python3 demo_inpainting.py \
 <!-- Original StableTTS README follows, preserved in full below.  -->
 <!-- ============================================================ -->
 
+> **The content below is the original README from the upstream [KdaiP/StableTTS](https://github.com/KdaiP/StableTTS) repository, preserved here for reference.**
+
+---
+
 <div align="center">
 
 # StableTTS
